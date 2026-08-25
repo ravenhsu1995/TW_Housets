@@ -675,11 +675,17 @@ verdict = {
         "mean_exceeds_2se": bool(abs(main_d) > 2 * main_se),
     },
 }
+# **crit1（MAPE 有沒有降低）是主判準，crit3（SHAP 排名）不是它的替代品。**
+# 影像特徵進得了 SHAP 前 10 只代表「樹用了它」，不代表 out-of-sample 有增量——
+# 本次實測就是這一格：NDVI 排第 10，而 ΔMAPE 是 −0.58 pp。
+# 所以 main_d ≤ 0 時一律 NOT_SUPPORTED，不能因為 crit3 過了就叫 PARTIAL。
+_sig_negative = bool(overall_cl["ci_hi"] < 0)
+verdict["derived"]["significantly_negative"] = _sig_negative
 verdict["overall"] = (
     "INVALID" if all_met and controls_status == "failed" else
     "SUPPORTED" if all_met and controls_status == "ok" else
-    "NULL" if is_null and n_met == 0 else
-    "NOT_SUPPORTED" if n_met == 0 else
+    "NOT_SUPPORTED_NEGATIVE" if _sig_negative else
+    "NOT_SUPPORTED" if main_d <= 0 or not crit1 and n_met <= 1 else
     "PARTIAL")
 
 bar = "=" * 78
@@ -715,7 +721,13 @@ print()
 print(f"  達成的成功標準：{n_met} / 3")
 print(f"  結論：**{verdict['overall']}**")
 print("  註：SUPPORTED=三條全過且負對照通過｜INVALID=三條全過但負對照失敗"
-      "｜NULL=沒有增量｜PARTIAL=部分達成")
+      "｜NOT_SUPPORTED_NEGATIVE=影像顯著讓模型變差｜NOT_SUPPORTED=沒有增量"
+      "｜PARTIAL=有正增量但未達標")
+if _sig_negative:
+    print()
+    print("  ⚠️  單元 cluster 的 95% CI 完全落在 0 以下——**影像特徵顯著讓模型變差**，")
+    print("      不只是「沒有幫助」。成功標準 3（SHAP 前 10）達成只代表樹用了那個特徵，")
+    print("      不代表 out-of-sample 有增量。")
 print(bar)
 
 (PROC / "modeling_result.json").write_text(

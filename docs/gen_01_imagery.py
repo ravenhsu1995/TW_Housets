@@ -352,11 +352,30 @@ EPS_DENOM = 0.02        # 分母（nir+red 等）小於這個值的像素不算�
 
 
 def reflectance_offset(item) -> float:
-    """回傳「我們還需要自己補」的 offset。已經套進像素的回 0。"""
+    """回傳要自己補的 offset。**對這個 collection 一律是 0**，理由見下。
+
+    Sentinel-2 的 processing baseline 04.00（2022-01-25）給 L2A 加了
+    `BOA_ADD_OFFSET = -1000`，反射率理論上要 `DN*1e-4 - 0.1`。
+    Earth Search 的 item 帶 `raster:bands.offset = -0.1`，並用
+    `earthsearch:boa_offset_applied` 表示「是否已經套進像素」。
+
+    **但那個 flag 不可靠。** 實測 2022 年有一批 item 標 `applied = False`，
+    而它們的像素其實已經是校正過的值——照著 flag 再套一次 offset 的後果：
+      · 413 列（8.2%，全部落在 2022 Q1–Q4，**正好在訓練窗口內**）被污染
+      · 其中臺中市和平區 2022Q1 的 NDVI 算出 **1.356**——正規化差值指數在數學上
+        不可能 > 1，除非反射率變成負的
+      · 這批列的 NDVI 中位 0.405、最大 1.356；其餘列最大只有 0.888
+
+    決定性的證據在像素而不在 metadata：同一片山林（臺北文山區）同一季（Q1）的
+    NIR 原始 DN 中位數，2019→2024 是 2318 / 2379 / 2308 / 2516 / 2467 / 2475
+    ——**baseline 轉換處沒有 1000 的階梯**，代表這個 archive 已經統一過口徑。
+
+    所以一律回 0，並把看到的 metadata 記進 `offset_meta` 供追蹤；
+    若 archive 哪天真的改成未校正，I4（值域）與 I5（已知日期的階梯）會抓到。
+    """
     rb = (item.assets["nir"].extra_fields.get("raster:bands") or [{}])[0]
-    off = float(rb.get("offset") or 0.0)
-    applied = bool(item.properties.get("earthsearch:boa_offset_applied", False))
-    return 0.0 if applied else off
+    return 0.0, (float(rb.get("offset") or 0.0),
+                 bool(item.properties.get("earthsearch:boa_offset_applied", False)))
 
 
 def search_items(cat, geom, q: pd.Period) -> tuple:
@@ -375,8 +394,11 @@ def search_items(cat, geom, q: pd.Period) -> tuple:
 def quarter_composite(items, geom) -> xr.Dataset:
     """SCL 遮罩後的逐季中位數合成。按「需要自己補的 offset」分組載入再併起來。"""
     groups: dict = {}
+    _seen_meta: set = set()
     for it in items:
-        groups.setdefault(reflectance_offset(it), []).append(it)
+        _off, _meta = reflectance_offset(it)
+        groups.setdefault(_off, []).append(it)
+        _seen_meta.add(_meta)
     parts, n_days = [], 0
     for off, its in groups.items():
         ds = odc.stac.load(its, bands=BANDS, geopolygon=geom, resolution=RESOLUTION,
@@ -392,6 +414,7 @@ def quarter_composite(items, geom) -> xr.Dataset:
     out = allp.median("time").compute()
     out.attrs["n_solar_days"] = n_days
     out.attrs["offsets_applied"] = sorted(groups)
+    out.attrs["offset_meta"] = sorted(_seen_meta)
     return out
 
 
@@ -457,12 +480,14 @@ def city_quarter(city: str, qs: str) -> pd.DataFrame:
         d = pd.DataFrame({"unit": sub["unit"].to_numpy(), "n_pixel": 0,
                           "valid_pixel_ratio": 0.0,
                           "NDVI": np.nan, "NDBI": np.nan, "MNDWI": np.nan})
-        d["n_scene"], d["n_solar_day"], d["offset_applied"] = 0, 0, ""
+        d["n_scene"], d["n_solar_day"] = 0, 0
+        d["offset_applied"], d["offset_meta"] = "", ""
     else:
         out = quarter_composite(items, hull)
         d = zonal(sub, out, indices(out))
         d["n_scene"], d["n_solar_day"] = len(items), out.attrs["n_solar_days"]
         d["offset_applied"] = ",".join(f"{o:g}" for o in out.attrs["offsets_applied"])
+        d["offset_meta"] = ";".join(f"{o:g}/{a}" for o, a in out.attrs["offset_meta"])
     d["cloud_lt"], d["縣市"], d["quarter"] = cc, city, qs
     d["secs"] = round(time.time() - t0, 1)
     d.to_parquet(cache, index=False)
@@ -586,16 +611,29 @@ by_q = (rs.groupby("quarter")
 print("逐季的有效像素佔比與 solar day 數\n")
 print(by_q.round(3).to_string())
 
-bad_q = by_q[by_q["vpr_mean"] < VPR_QUARTER_MIN]
+# **有效像素佔比低，要分兩種情況。**
+#   (a) 那一季本來就沒幾張影像（solar day 不足）→ 是「來源沒有資料」，由 I3 標記，
+#       不該在這裡再判一次失敗。實測 2017Q2 全台只有 1 個 solar day、vpr 0.23，
+#       那是已知且已寫進文件的事實（ESA 當年對東亞的取像計畫疏），不是缺陷。
+#   (b) 影像張數夠、卻被雲遮罩刮掉大部分 → **這才是 I2 要抓的**，因為它會讓
+#       那一季的指數由少數殘留像素決定，而統計量看起來完全正常。
+_thin_q = set(by_q.index[by_q["days_min"] < MIN_SOLAR_DAYS])
+_low_q = set(by_q.index[by_q["vpr_mean"] < VPR_QUARTER_MIN])
+bad_q = by_q.loc[sorted(_low_q - _thin_q)]
 checks["I2"] = {"floor": VPR_FLOOR, "quarter_min": VPR_QUARTER_MIN,
                 "n_low_cells": int(rs["low_vpr"].sum()),
                 "low_cell_share": round(float(rs["low_vpr"].mean()), 4),
-                "bad_quarters": list(bad_q.index)}
+                "bad_quarters": list(bad_q.index),
+                "low_but_thin_quarters": sorted(_low_q & _thin_q)}
 print(f"\nvalid_pixel_ratio < {VPR_FLOOR} 的 cell：{int(rs['low_vpr'].sum()):,} 個"
       f"（{rs['low_vpr'].mean():.1%}）")
+if _low_q & _thin_q:
+    print(f"⚠️  {len(_low_q & _thin_q)} 個季的有效像素佔比低，但**原因是影像張數不足**"
+          f"（由 I3 標記，不判 I2 失敗）：{sorted(_low_q & _thin_q)}")
 if len(bad_q):
     imagery_fail(
-        f"❌ I2：{len(bad_q)} 個季的平均有效像素佔比低於 {VPR_QUARTER_MIN}",
+        f"❌ I2：{len(bad_q)} 個季**影像張數足夠卻**被雲遮罩刮到"
+        f"平均有效像素佔比低於 {VPR_QUARTER_MIN}",
         "\n".join([f"    {q}：平均 {r.vpr_mean:.2f}、最小 {r.vpr_min:.2f}、"
                    f"solar day 最少 {r.days_min:.0f}" for q, r in bad_q.iterrows()] +
                   ["", "那幾季的雲遮罩把大部分像素刮掉了。可以：",
@@ -662,7 +700,7 @@ _st = rs[rs["unit"].isin(stable) & rs["NDVI"].notna()].copy()
 _st["q"] = pd.PeriodIndex(_st["quarter"], freq="Q")
 _split = pd.Period(BASELINE_SPLIT, freq="Q")
 # 同季比同季，避免季節性混進來
-_piv = (_st.assign(season=_st["q"].quarter,
+_piv = (_st.assign(season=_st["q"].dt.quarter,
                    era=np.where(_st["q"] < _split, "before", "after"))
            .groupby(["season", "era"])["NDVI"].median().unstack("era"))
 _piv = _piv.dropna()
@@ -823,7 +861,7 @@ md(r"""
 code(r'''
 OUT_COLS = ["unit", "quarter", "縣市", "NDVI", "NDBI", "MNDWI", "dNDVI", "dNDBI",
             "valid_pixel_ratio", "n_pixel", "n_scene", "n_solar_day", "cloud_lt",
-            "offset_applied"]
+            "offset_applied", "offset_meta"]
 out = rs[OUT_COLS].copy()
 out.to_csv(PROC / "unit_remote_sensing.csv", index=False, encoding="utf-8-sig")
 print(f"已寫出 {PROC / 'unit_remote_sensing.csv'}（{len(out):,} 列）")
