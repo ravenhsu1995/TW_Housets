@@ -129,11 +129,46 @@ _bd = pd.to_numeric(lvr["建築完成年月"], errors="coerce")
 _by = np.where(_bd > 1000, _bd // 10000 + 1911, np.nan)
 lvr["屋齡"] = lvr["交易日"].dt.year - _by
 lvr.loc[(lvr["屋齡"] < 0) | (lvr["屋齡"] > 100), "屋齡"] = np.nan
-lvr["樓層比"] = (pd.to_numeric(
-    lvr["移轉層次"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
-    / pd.to_numeric(lvr["總樓層數"].astype(str).str.extract(r"(\d+)")[0],
-                    errors="coerce").replace(0, np.nan))
+# **樓層是中文數字。** 實測 `移轉層次` 的值是「四層」「十一層」、`總樓層數` 是
+# 「十五層」——用 `str.extract(r"(\d+)")` 抓阿拉伯數字會得到**全部 NaN**，
+# 而 NaN 欄位在樹模型裡不會報錯、只是完全沒有資訊。
+# （這個 bug 是靠「某個特徵 100% NaN」這個下游症狀才被發現的。）
+_CN = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+       "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def cn_floor(v) -> float:
+    """「十五層」→ 15。地下層／全／見其他登記事項 等回 NaN。"""
+    t = str(v).strip()
+    if not t or t == "nan" or "地下" in t or "全" in t or "其他" in t:
+        return np.nan
+    t = t.replace("層", "").replace("　", "").strip()
+    if t.isdigit():
+        return float(t)
+    total, cur = 0, 0
+    for ch in t:
+        if ch in _CN:
+            cur = cur * 10 + _CN[ch] if cur and ch == "零" else _CN[ch]
+        elif ch == "十":
+            cur = (cur or 1) * 10
+            total, cur = total + cur, 0
+        elif ch == "百":
+            cur = (cur or 1) * 100
+            total, cur = total + cur, 0
+        else:
+            return np.nan
+    return float(total + cur) or np.nan
+
+
+_lv = lvr["移轉層次"].map(cn_floor)
+_tt = lvr["總樓層數"].map(cn_floor)
+print(f"樓層解析率：移轉層次 {_lv.notna().mean():.1%}、總樓層數 {_tt.notna().mean():.1%}")
+if _lv.notna().mean() < 0.8 or _tt.notna().mean() < 0.8:
+    print("⚠️  樓層解析率偏低——來源的寫法可能又變了，檢查 cn_floor。"
+          "（這個欄位若全是 NaN，模型不會報錯，只是白佔一個特徵。）")
+lvr["樓層比"] = _lv / _tt.replace(0, np.nan)
 lvr.loc[(lvr["樓層比"] <= 0) | (lvr["樓層比"] > 1.2), "樓層比"] = np.nan
+lvr["總樓層"] = _tt
 
 agg = (lvr.groupby(["unit", "period"], observed=True)
           .agg(price_median=("單價元每坪", "median"),
@@ -143,6 +178,7 @@ agg = (lvr.groupby(["unit", "period"], observed=True)
                area_median=("房屋面積坪", "median"),
                age_median=("屋齡", "median"),
                floor_ratio_median=("樓層比", "median"),
+               total_floor_median=("總樓層", "median"),
                parking_unsplit_share=("車位價未拆", "mean"))
           .reset_index())
 agg["quarter"] = agg["period"].dt.asfreq("Q")
@@ -162,8 +198,15 @@ lvr["zone_grp"] = np.select(
     [_zone.str.contains("住"), _zone.str.contains("商"),
      _zone.str.contains("工"), _zone.str.contains("農")],
     ["住", "商", "工", "農"], default="其他")
-zone = (lvr.pivot_table(index="unit", columns="zone_grp", values="編號",
-                        aggfunc="size", fill_value=0))
+# **只用訓練期的交易算組成。** 用全期算的話，這個「時間不變」的特徵裡就含有
+# 測試期交易的資訊（實測單元內唯一值數 = 1，也就是整段測試期共用同一個值）。
+# 邊界跟 NB3 的切分對齊；NB3 若改切分，這裡要一起改。
+ZONE_TRAIN_END = pd.Period("2022Q4", freq="Q")
+_ztrain = lvr[lvr["quarter"] <= ZONE_TRAIN_END]
+print(f"土地使用分區組成只用 {ZONE_TRAIN_END} 之前的 {len(_ztrain):,} 筆"
+      f"（全期 {len(lvr):,} 筆）——避免把測試期交易的組成洩漏進特徵")
+zone = (_ztrain.pivot_table(index="unit", columns="zone_grp", values="編號",
+                            aggfunc="size", fill_value=0))
 zone = zone.div(zone.sum(axis=1).replace(0, np.nan), axis=0)
 zone.columns = [f"zone_share_{c}" for c in zone.columns]
 zone = zone.reset_index()
@@ -365,7 +408,16 @@ URL 有規律：`https://www.fia.gov.tw/WEB/fia/ias/ias{ROC}/{ROC}_165-9.csv`。
 
 code(r'''
 INCOME_URL = "https://www.fia.gov.tw/WEB/fia/ias/ias{y}/{y}_165-9.csv"
-years_needed = list(range(DATE_START.year, DATE_END.year + 1))
+# **所得必須 lag。** 財政部的年度所得約落後兩年才發布（實測 2026-08 時民國 112 有、
+# 113 還沒有）。直接用「同年」的所得等於預測 2023 年 1 月時就知道 2023 全年的所得
+# ——那是前視資訊，而 M4 的名稱黑名單與「相關 > 0.98」都抓不到
+# （實測 income_mean 與 Y 的相關只有 0.62）。
+# 所以要抓的年份是「窗口年份各往前推 LAG 年」，不是窗口年份本身。
+INCOME_LAG_YEARS = 2
+years_needed = list(range(DATE_START.year - INCOME_LAG_YEARS,
+                          DATE_END.year - INCOME_LAG_YEARS + 1))
+print(f"所得 lag {INCOME_LAG_YEARS} 年 → 需要 {years_needed[0]}–{years_needed[-1]} 年的資料"
+      f"（對應窗口 {DATE_START.year}–{DATE_END.year}）")
 
 
 def fetch_income(west_year: int) -> pd.DataFrame:
@@ -430,6 +482,7 @@ def fetch_income(west_year: int) -> pd.DataFrame:
 
 inc_parts = [fetch_income(y) for y in years_needed]
 inc = pd.concat([x for x in inc_parts if len(x)], ignore_index=True)
+inc["income_year_used"] = inc["year"]      # 先設好，沒有遞延時也要存在
 have_years = sorted(inc["year"].unique())
 print(f"所得年份：{have_years}")
 missing_years = [y for y in years_needed if y not in have_years]
@@ -442,7 +495,14 @@ if missing_years:
                         ignore_index=True)
         inc.loc[inc["year"] == y, "income_year_used"] = latest
 inc["income_year_used"] = inc["income_year_used"].fillna(inc["year"]).astype(int)
-print(f"所得表 {len(inc):,} 列（單元 × 年）")
+print(f"所得表 {len(inc):,} 列（單元 × 年）"
+      f"｜遞延的年份 {sorted(set(inc.loc[inc.income_year_used != inc.year, 'year'])) or '無'}")
+
+inc_lagged = inc.copy()
+inc_lagged["year"] = inc_lagged["year"] + INCOME_LAG_YEARS
+inc_lagged = inc_lagged.rename(columns={"income_year_used": "income_source_year"})
+print(f"所得往後推 {INCOME_LAG_YEARS} 年當特徵："
+      f"預測第 Y 年用第 Y−{INCOME_LAG_YEARS} 年的所得（發布時點才拿得到）")
 
 # ---- 戶數（戶政司，NB0 已快取）----
 _vp = next(iter(sorted(RAW.glob("villages_*.parquet"))), None)
@@ -463,10 +523,16 @@ df["year"] = df["period"].dt.year
 out = (df.merge(poi_feat, on="unit", how="left", validate="many_to_one")
          .merge(zone, on="unit", how="left", validate="many_to_one")
          .merge(hh, on="unit", how="left", validate="many_to_one")
-         .merge(inc[["unit", "year", "income_mean", "income_median_w",
-                     "income_year_used"]],
+         .merge(inc_lagged[["unit", "year", "income_mean", "income_median_w",
+                            "income_source_year"]],
                 on=["unit", "year"], how="left", validate="many_to_one"))
 out["hh_density"] = out["n_household"] / out["area_km2"]
+
+# 所得有一個**全體同步的水準斷點**（實測 2018→2019 中位數 −23.8%、92% 的單元同步
+# 下跌，追到原始 CSV 確認斷點在來源本身），而且測試期的絕對值會落在訓練期範圍之外
+# → 樹模型只能把它塞進末端葉。加一個**單元內相對值**，讓測試期的值落回訓練期範圍。
+_um = out.groupby("unit")["income_mean"].transform("median")
+out["income_rel"] = out["income_mean"] / _um.replace(0, np.nan)
 
 # ---- 時間特徵（計畫 §5.2 步驟 7）----
 out["t_index"] = (out["period"] - out["period"].min()).apply(lambda x: x.n)
@@ -519,15 +585,36 @@ def merge_fail(title: str, detail: str) -> None:
 
 
 k = out[out.keep].copy()
-FEATS_A = ([c for c in k.columns if c.startswith(("n_", "dens_", "dist_", "zone_share_"))
-            if c != "n_tx"]
-           + ["area_km2", "hh_density", "income_mean", "income_median_w",
-              "area_median", "age_median", "floor_ratio_median",
-              "t_index", "q_sin", "q_cos"]
-           + (["m_sin", "m_cos"] if TIME_UNIT == "月" else []))
-FEATS_B = FEATS_A + ["NDVI", "NDBI", "MNDWI", "dNDVI", "dNDBI"]
-FEATS_A = [c for c in FEATS_A if c in k.columns]
-FEATS_B = [c for c in FEATS_B if c in k.columns]
+# **絕對不能進特徵集的東西**：
+#   · n_tx / price_*：由 Y 那批交易算出來的
+#   · n_solar_day / valid_pixel_ratio：**Sentinel-2 的產物**。放進 A 的話「無影像
+#     基準」就用到了衛星資料（而且它是雲量與取像密度的代理，帶季節與地形資訊）。
+#     實測把它從 A 拿掉，ΔMAPE 動 0.22 pp。只當品質篩選用。
+NEVER_FEATURE = {"n_tx", "n_solar_day", "valid_pixel_ratio", "n_pixel",
+                 "n_household", "n_taxunit", "keep", "year"}
+
+# 特徵集分三層，因為「A 怎麼定義」造成的 ΔMAPE 分散實測比 2 pp 的成功門檻還大。
+#   A0：**純外生**——完全不含由「當期那批交易」算出來的東西
+#   A1：A0 + 當期交易的建物屬性組成（計畫 §5.3 字面要求的「建物屬性」，但那是同期資訊）
+#   A2：A1 + 土地使用分區組成（已限定只用訓練期交易，見 §1）
+_poi = [c for c in k.columns
+        if c.startswith(("dens_", "dist_")) or
+        (c.startswith("n_") and c not in NEVER_FEATURE)]
+FEATS_A0 = ([c for c in _poi if c not in NEVER_FEATURE]
+            + ["area_km2", "hh_density", "income_mean", "income_median_w",
+               "income_rel", "t_index", "q_sin", "q_cos"]
+            + (["m_sin", "m_cos"] if TIME_UNIT == "月" else []))
+CONTEMP = ["area_median", "age_median", "floor_ratio_median", "total_floor_median"]
+FEATS_A1 = FEATS_A0 + CONTEMP
+FEATS_A2 = FEATS_A1 + [c for c in k.columns if c.startswith("zone_share_")]
+IMG = ["NDVI", "NDBI", "MNDWI", "dNDVI", "dNDBI"]
+_flt = lambda L: [c for c in dict.fromkeys(L)
+                  if c in k.columns and c not in NEVER_FEATURE]
+FEATS_A0, FEATS_A1, FEATS_A2 = _flt(FEATS_A0), _flt(FEATS_A1), _flt(FEATS_A2)
+# 主特徵集 = A1（計畫 §5.3 的字面定義）；A0/A2 由 NB3 當敏感度層
+FEATS_A, FEATS_B = FEATS_A1, _flt(FEATS_A1 + IMG)
+print(f"特徵層：A0 純外生 {len(FEATS_A0)}｜A1 +同期建物屬性 {len(FEATS_A1)}"
+      f"｜A2 +分區組成 {len(FEATS_A2)}｜影像 {len(_flt(IMG))}")
 
 # ---- M1：特徵的 NaN ----
 nan_share = k[FEATS_B].isna().mean().sort_values(ascending=False)
@@ -602,12 +689,29 @@ mchecks["M4"] = {"leak_by_name": LEAK_NAMES, "leak_by_corr": LEAK_CORR,
                               for c, v in _corr.abs().nlargest(6).items()}}
 print("與 Y 相關性最高的特徵（絕對值）")
 print(_corr.abs().nlargest(6).round(3).to_string())
-if LEAK_NAMES or LEAK_CORR:
-    merge_fail(f"❌ M4：疑似目標洩漏 名稱={LEAK_NAMES} 相關>0.98={LEAK_CORR}",
-               "    特徵集不能含由價格算出來的欄位，否則 MAPE 會好得沒有意義。")
+# 第三道：**前視檢查**。名稱黑名單與相關門檻都抓不到「逐年特徵配逐月 Y」
+# （同年 12 個月共用一個值，等於預測 1 月時就知道全年）。這裡直接量
+# 「單元 × 年」內的唯一值數：若為 1 而 Y 的粒度是月，那個特徵就是年度常數。
+YEARLY_OK = {"income_mean", "income_median_w", "income_rel"}   # 已 lag 過的
+lookahead = []
+if TIME_UNIT == "月":
+    for c in FEATS_B:
+        if k.groupby(["unit", "year"])[c].nunique(dropna=False).max() == 1 \
+                and k.groupby("unit")[c].nunique(dropna=False).max() > 1:
+            if c not in YEARLY_OK:
+                lookahead.append(c)
+mchecks["M4"]["yearly_constant_not_lagged"] = lookahead
+print(f"年度常數但未 lag 的特徵：{lookahead or '（無）'}")
+if LEAK_NAMES or LEAK_CORR or lookahead:
+    merge_fail(
+        f"❌ M4：疑似目標洩漏 名稱={LEAK_NAMES} 相關>0.98={LEAK_CORR} "
+        f"年度常數未 lag={lookahead}",
+        "    特徵集不能含由價格算出來的欄位，也不能含「預測時點還拿不到」的欄位。\n"
+        "    逐年特徵要 lag 到發布時點真正可得的年份（見 §4 的 INCOME_LAG_YEARS）。")
 else:
     print("✅ M4：沒有目標洩漏（最高相關 "
-          f"{_corr.abs().max():.3f}，來自 {_corr.abs().idxmax()}）")
+          f"{_corr.abs().max():.3f}，來自 {_corr.abs().idxmax()}）；"
+          "逐年特徵都已 lag")
 ''')
 
 code(r'''
@@ -634,10 +738,15 @@ md(r"""
 """)
 
 code(r'''
+# **要匯出所有層的特徵，不只 FEATS_B。** 只匯出 FEATS_B 的話，A2 層的
+# zone_share_* 不會進 parquet，而 NB3 的 TIERS 又是從 meta 讀名字再
+# `if c in tbl.columns` 過濾——結果 A2 會靜默退化成跟 A1 一樣，
+# 「三層敏感度」少了一層而沒有任何訊號。
+_ALL_FEATS = list(dict.fromkeys(FEATS_A0 + FEATS_A1 + FEATS_A2 + _flt(IMG)))
 KEEP_COLS = (["unit", "縣市", "period", "quarter", "year", "keep",
               "price_median", "price_p25", "price_p75", "n_tx",
-              "valid_pixel_ratio", "n_solar_day", "income_year_used"]
-             + [c for c in FEATS_B if c not in ("t_index",)] + ["t_index"])
+              "valid_pixel_ratio", "n_solar_day", "income_source_year"]
+             + [c for c in _ALL_FEATS if c != "t_index"] + ["t_index"])
 KEEP_COLS = list(dict.fromkeys([c for c in KEEP_COLS if c in out.columns]))
 tbl = out[KEEP_COLS].copy()
 tbl["period"] = tbl["period"].astype(str)
@@ -660,6 +769,10 @@ meta = {
     "n_rows": int(len(tbl)), "n_keep": int(tbl.keep.sum()),
     "n_units": int(tbl.unit.nunique()), "n_periods": int(tbl.period.nunique()),
     "features_A": FEATS_A, "features_B": FEATS_B,
+    "feature_tiers": {"A0": FEATS_A0, "A1": FEATS_A1, "A2": FEATS_A2,
+                      "img": _flt(IMG)},
+    "never_feature": sorted(NEVER_FEATURE),
+    "income_lag_years": INCOME_LAG_YEARS,
     "target": "price_median",
     "filters": {"min_n_tx": MIN_N_TX, "min_valid_pixel_ratio": VPR_FLOOR},
     "structural_repeat_with_price": RSM["structural_repeat_with_price"],
@@ -671,6 +784,14 @@ meta = {
         "土地使用分區用交易組成當代理、不是面積佔比 → **偏袒影像**："
         "建成區面積佔比與 NDBI 量的是同一件事",
         "戶數是靜態快照（無時間變異），是慢變控制變數",
+        "特徵集 A 的定義本身會讓 ΔMAPE 大幅移動（實測跨合理定義的分散比 2 pp 的"
+        "成功門檻還大）→ 分成 A0（純外生）／A1（+同期建物屬性，計畫字面定義）／"
+        "A2（+分區組成）三層，NB3 要三層都報，結論只在符號一致時才成立",
+        "A1／A2 含「當期那批交易」算出來的組成（坪數、屋齡、樓層中位數）——"
+        "那與 Y 出自同一個 groupby，對「預測」的主張而言是同期前視。"
+        "主結果用 A1（計畫字面要求）但必須同時報 A0",
+        "n_solar_day / valid_pixel_ratio 是 Sentinel-2 的產物，已從特徵集移除"
+        "（只當品質篩選）——放進 A 的話「無影像基準」就用到了衛星資料",
         f"2024 年的所得用 {max(have_years)} 年遞延（財政部尚未發布）"
         "→ NB3 要對 income_year_used 做敏感度測試",
         "NB1 提醒：2017 各季影像不可用、帶差分特徵的窗口從 2019Q1 起——"

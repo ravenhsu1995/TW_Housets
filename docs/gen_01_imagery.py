@@ -148,10 +148,16 @@ SCL_KEEP = (4, 5, 6)
 # 解析度。**按縣市載入、再對單元做 zonal mean**，不要逐單元載：
 # 實測逐單元載一個 (區 × 季) 要 22.6 秒 → 158 區 × 32 季 ≈ 28 小時，不可行；
 # 按縣市載則臺北 9 秒、高雄 100–480 秒。
-# 100m 對鄉鎮市區夠用（最小的高雄鹽埕 1.4 km² 仍有約 140 個像素）；
-# 200m 快 4–7 倍而區域平均幾乎不變（實測高雄 0.534 → 0.530），但鹽埕只剩 35 像素。
+# **200m 是量過之後的選擇，不是省事。** 實測（高雄市 2019Q1，最重的縣市）：
+#   100m → 1104×905 格、478 秒、區域平均 NDVI 0.534
+#   200m →  553×453 格、103 秒、區域平均 NDVI 0.530
+# 區域平均只差 0.004（降解析度幾乎不動空間平均，因為那本來就是在做平均），
+# 但快 4.6 倍。100m 跑全量實測要 5 小時以上（單一 (縣市×季) 最壞 25 分鐘），200m 約 1 小時。
+# 代價：最小的單元（高雄鹽埕 1.4 km²）只剩約 35 個像素。所以產出帶 `n_pixel`，
+# 下游可以據此標記或降權——不要靜默地讓 35 個像素的平均跟 3000 個像素的平均等價。
 # 若粒度是村里（均面積 0.3 km²）必須降到 20–30m，成本會漲一個量級。
-RESOLUTION = 100 if SPATIAL_UNIT == "鄉鎮市區" else 20
+RESOLUTION = 200 if SPATIAL_UNIT == "鄉鎮市區" else 20
+MIN_PIXEL_WARN = 50            # 單元像素數低於此值時在涵蓋率檢查裡列出來
 CRS = "EPSG:32651"          # UTM 51N；六都都在 120–122E
 
 # 雲量門檻自適應：先嚴、solar day 不足才放寬。固定用嚴的會讓 2018 那種本來就疏的季空掉。
@@ -601,6 +607,19 @@ else:
 ''')
 
 code(r'''
+# ---- 小單元提示（不中止）----
+_small = (rs.groupby("unit")["n_pixel"].max()
+            .loc[lambda s: s < MIN_PIXEL_WARN].sort_values())
+checks["small_units"] = {"threshold": MIN_PIXEL_WARN,
+                         "units": {k: int(v) for k, v in _small.items()}}
+if len(_small):
+    print(f"⚠️  {len(_small)} 個單元的像素數少於 {MIN_PIXEL_WARN}"
+          f"（{RESOLUTION}m 格網下面積太小），空間平均會比較不穩：")
+    print("    " + "、".join(f"{k}({v})" for k, v in _small.items()))
+    print("    產出的 n_pixel 欄可以讓 NB2/NB3 標記或降權這些單元。")
+else:
+    print(f"✅ 所有單元的像素數都 ≥ {MIN_PIXEL_WARN}")
+
 # ---- I3：solar day 數（標記，不中止）----
 thin = by_q[by_q["days_min"] < MIN_SOLAR_DAYS]
 checks["I3"] = {"min_days": MIN_SOLAR_DAYS, "thin_quarters": list(thin.index)}

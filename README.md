@@ -10,8 +10,8 @@
 |---|---|---|
 | [`00_density_check`](notebooks/00_density_check.ipynb) | Y 變數密度分析 → **決定粒度** | ✅ 已跑完真實資料 |
 | [`01_imagery`](notebooks/01_imagery.ipynb) | Sentinel-2 → 遙測指數 CSV | ✅ 可執行 |
-| [`02_data_merge`](notebooks/02_data_merge.ipynb) | 實價登錄 + 遙測 + POI + 社經 → 大表 | ⬜ 骨架 |
-| [`03_modeling`](notebooks/03_modeling.ipynb) | XGBoost A vs B → MAPE 比較 | ⬜ 骨架 |
+| [`02_data_merge`](notebooks/02_data_merge.ipynb) | 實價登錄 + 遙測 + POI + 社經 → 大表 | ✅ 可執行 |
+| [`03_modeling`](notebooks/03_modeling.ipynb) | XGBoost A vs B → **假設的答案** | ✅ 可執行 |
 | [`04_vlm_narratives`](notebooks/04_vlm_narratives.ipynb) | Claude 解讀影像對 → 變遷故事 | ⬜ 骨架 |
 | [`app/streamlit_app.py`](app/streamlit_app.py) | Demo dashboard | ⬜ 骨架 |
 
@@ -61,6 +61,35 @@ NB0 全自動，**不需要手動下載任何資料**：
 | `data/processed/lvr_clean.parquet` | 清整後的實價登錄，NB2 直接重用 |
 | `data/processed/figs/*.png` | 三張圖表 |
 | `data/processed/coverage_snapshot.json` | 涵蓋率的跨次執行基準（不進版控，見下方 Layer 5） |
+
+## NB1–NB3 與計畫的差異（都有實測依據）
+
+| 計畫寫的 | 實際做的 | 依據 |
+|---|---|---|
+| 第一天先註冊 GEE、等審核 1–3 天 | **完全不用 GEE**，走 Earth Search STAC + AWS COG（匿名） | 實測可讀，一樣 $0 |
+| 影像窗口 2017Q1–2024Q4 | **2018Q1 起**；帶差分特徵的建模窗口 **2019Q1 起** | 2017Q2 連一張雲量 <40% 的 Sentinel-2 都沒有 |
+| 影像解析度 10m/20m | 分析單元級統計用 **200m** 重採樣 | 區域平均只差 0.004（0.534→0.530）而快 4.6 倍 |
+| 捷運「通車前後」二元特徵 | 只有靜態站點數與距離 | OSM `start_date` 覆蓋率只有 11%；NB3 的 N4 部分補上 |
+| 土地使用分區的面積佔比 | 交易的分區組成當代理 | 面積佔比需另一份 shapefile |
+
+**後兩項會偏袒影像**——被省略的非影像特徵越多，影像看起來越好。所以 NB3 的結論
+一定要連同 `known_biases` 一起讀，而且必須先看負對照（N1 隨機雜訊、N2 時間打散）
+再看主結果。
+
+## 一個差點毀掉整個實驗的坑
+
+Sentinel-2 的 processing baseline 04.00（2022-01-25 起）給 L2A 加了
+`BOA_ADD_OFFSET = -1000`。**NDVI 是比值但 offset 是加法，不會抵銷**——沒處理的話
+2022 之後會出現一個假的階梯，長得跟真的都市化一模一樣，而且方向剛好會讓
+「加了影像特徵後 MAPE 變好」變得不可信。
+
+metadata 自相矛盾（`raster:bands.offset = -0.1` 同時 `boa_offset_applied = True`），
+所以去看像素：同一片山林同一季的 NIR 原始 DN 中位數 2019→2024 是
+**2318 / 2379 / 2308 / 2516 / 2467 / 2475**——沒有 1000 的階梯，代表 Earth Search
+已經套好了。再套一次會讓 NDVI 爆到 **−1442**。
+
+NB1 因此有一層檢查（I5）拿 **ESA 公布的轉換日**當已知測試點：穩定地物（山林區）
+的 NDVI 不該在 2021/2022 之間出現階梯。
 
 ## 涵蓋率檢查：十層
 

@@ -73,13 +73,17 @@ except ImportError:
 
 PROC = PROJECT / "data" / "processed"
 NEED = {"NB2 大表": PROC / "modeling_table.parquet",
-        "NB2 中介資料": PROC / "merge_meta.json"}
+        "NB2 中介資料": PROC / "merge_meta.json",
+        "NB1 中介資料": PROC / "rs_meta.json"}
 _miss = {k: v for k, v in NEED.items() if not v.exists()}
 if _miss:
     raise FileNotFoundError("缺少上游產出：\n"
                             + "\n".join(f"  {k}：{v}" for k, v in _miss.items()))
 
 MM = json.loads(NEED["NB2 中介資料"].read_text(encoding="utf-8"))
+# NB1 的中介資料：需要它的 I3「solar day 不足的季」來決定訓練起點——
+# 差分特徵的**基期**若落在不可用的季，那一整年的 B 訊號都是雜訊。
+RSM = json.loads(NEED["NB1 中介資料"].read_text(encoding="utf-8"))
 if not MM["checks"]["passed"]:
     print("⚠️  NB2 的合理性檢查沒有全部通過——先看 merge_meta.json 的 checks 再繼續。")
 print(f"粒度：{MM['scheme']}｜結構性重複：{MM['structural_repeat_with_price']}")
@@ -93,11 +97,26 @@ tbl["quarter"] = pd.PeriodIndex(tbl["quarter"], freq="Q")
 tbl = tbl[tbl["keep"]].copy()
 print(f"\n大表：{len(tbl):,} 列（單元 {tbl.unit.nunique()}、期 {tbl.period.nunique()}）")
 
-FEATS_A = [c for c in MM["features_A"] if c in tbl.columns]
-IMG_FEATS = [c for c in MM["features_B"] if c not in MM["features_A"] and c in tbl.columns]
+TIERS = {k: [c for c in v if c in tbl.columns]
+         for k, v in MM["feature_tiers"].items() if k != "img"}
+IMG_FEATS = [c for c in MM["feature_tiers"]["img"] if c in tbl.columns]
+PRIMARY_TIER = "A1"          # 計畫 §5.3 的字面定義（含建物屬性）
+FEATS_A = TIERS[PRIMARY_TIER]
 FEATS_B = FEATS_A + IMG_FEATS
 TARGET = MM["target"]
-print(f"特徵集 A：{len(FEATS_A)} 個｜影像特徵：{IMG_FEATS}")
+for k, v in TIERS.items():
+    print(f"特徵層 {k}：{len(v)} 個")
+print(f"影像特徵：{IMG_FEATS}｜主層 = {PRIMARY_TIER}")
+# 100% NaN 的特徵要拿掉：它沒有資訊，但會改變 colsample 的 RNG 路徑，
+# 實測光是移除一個零資訊欄就能讓 ΔMAPE 動 0.7 pp（純雜訊）。
+_allnan = [c for c in set(sum(TIERS.values(), [])) | set(IMG_FEATS)
+           if tbl[c].isna().all()]
+if _allnan:
+    print(f"⚠️  移除 {len(_allnan)} 個全 NaN 的特徵：{_allnan}")
+    TIERS = {k: [c for c in v if c not in _allnan] for k, v in TIERS.items()}
+    IMG_FEATS = [c for c in IMG_FEATS if c not in _allnan]
+    FEATS_A = TIERS[PRIMARY_TIER]
+    FEATS_B = FEATS_A + IMG_FEATS
 ''')
 
 md(r"""
@@ -110,9 +129,23 @@ md(r"""
 """)
 
 code(r'''
-# 差分特徵齊全的最早一季（不硬編，讓資料決定）
-_ok = tbl.dropna(subset=[c for c in IMG_FEATS if c.startswith("d")])
-TRAIN_START = _ok["quarter"].min() if len(_ok) else tbl["quarter"].min()
+# 起點要同時滿足兩件事，**不能只用 min()**：
+#   (a) 差分特徵在**絕大多數**單元上齊全（用 min() 的話一個單元就能把起點拉早）
+#   (b) 差分的**基期**（Q−4）本身是可用的季——NB1 已經判定 2017 各季 solar day
+#       過少而不可用，而 dNDVI(2018Q1) 的基期正是 2017Q1（實測 solar day 中位 2）
+_dcols = [c for c in IMG_FEATS if c.startswith("d")]
+_cov = (tbl.assign(_ok=tbl[_dcols].notna().all(axis=1))
+           .groupby("quarter")["_ok"].mean())
+DIFF_COVER_MIN = 0.90
+_cand = [q for q, v in _cov.items() if v >= DIFF_COVER_MIN]
+# NB1 記錄的不可用季（solar day 不足）→ 基期落在裡面的季一律排除
+_thin = set(pd.PeriodIndex(RSM["checks"].get("I3", {}).get("thin_quarters", []), freq="Q")) \
+    if RSM["checks"].get("I3", {}).get("thin_quarters") else set()
+_cand = [q for q in _cand if (q - 4) not in _thin]
+TRAIN_START = min(_cand) if _cand else tbl["quarter"].min()
+print(f"差分覆蓋率 ≥ {DIFF_COVER_MIN:.0%} 且基期可用的最早一季：{TRAIN_START}")
+print(f"  NB1 判定 solar day 不足的季：{sorted(str(q) for q in _thin) or '（無）'}")
+print(f"  逐季差分覆蓋率（前 8 季）：{_cov.head(8).round(2).to_dict()}")
 TRAIN_END, VAL_END, TEST_END = (pd.Period("2022Q4", "Q"), pd.Period("2023Q2", "Q"),
                                 pd.Period("2024Q4", "Q"))
 print(f"差分特徵齊全的最早一季：{TRAIN_START}（計畫寫 2017Q1，實際用不了）")
@@ -152,12 +185,19 @@ md(r"""
 code(r'''
 import xgboost as xgb
 
-N_SEEDS = 10
+N_SEEDS = 20          # 實測 ΔMAPE 對 seed 批次的敏感度約 ±0.4 pp，10 個不夠
+# **容量要對齊。** B 比 A 多 5 個特徵，`colsample_bytree=0.8` 會讓 B 每棵樹抽到
+# 更多欄（0.8×34=28 vs 0.8×39=32），而 early stopping 又讓 B 平均多訓 109 棵樹
+# （實測 A 192 棵 vs B 301 棵）。實測把每棵樹的欄數固定成相同絕對值之後，
+# ΔMAPE 動 0.6 pp——那個量級足以決定「≥ 2 pp」過不過。
+# 做法：colsample_bytree = COLSAMPLE_K / 特徵數，兩邊每棵樹都抽同樣多欄。
+COLSAMPLE_K = 27
 PARAMS = dict(n_estimators=600, max_depth=6, learning_rate=0.05,
-              subsample=0.8, colsample_bytree=0.8,
+              subsample=0.8,
               min_child_weight=5, reg_lambda=1.0,
               objective="reg:squarederror", tree_method="hist")
 EARLY_STOP = 50
+LOG_TARGET = True
 
 
 def mape(y, p):
@@ -168,13 +208,18 @@ def mdape(y, p):
     return float(np.median(np.abs((y - p) / y)) * 100)
 
 
-def fit_predict(feats, seed: int, d=None, log_target: bool = True):
-    """回傳 (test 的預測, 用到的模型)。log 目標讓誤差在比例上對稱（房價是右偏的）。"""
+def fit_predict(feats, seed: int, d=None, log_target: bool = None):
+    """回傳 (test 的預測, 模型)。log 目標讓誤差在比例上對稱（房價右偏）。
+
+    注意 log 反推有 Jensen 偏誤（實測平均相對偏誤 −8.7%），所以主結果同時報 MdAPE。
+    """
+    log_target = LOG_TARGET if log_target is None else log_target
     d = data if d is None else d
     tr, va, te = (d[d.split == s] for s in ("train", "val", "test"))
     ytr = np.log(tr[TARGET]) if log_target else tr[TARGET]
     yva = np.log(va[TARGET]) if log_target else va[TARGET]
     m = xgb.XGBRegressor(**PARAMS, random_state=seed,
+                         colsample_bytree=min(1.0, COLSAMPLE_K / max(len(feats), 1)),
                          early_stopping_rounds=EARLY_STOP)
     m.fit(tr[feats], ytr, eval_set=[(va[feats], yva)], verbose=False)
     p = m.predict(te[feats])
@@ -198,10 +243,12 @@ def run_ab(feats_a, feats_b, d=None, n_seeds=N_SEEDS, tag=""):
             "ape_A": np.abs((y - pa) / y) * 100, "ape_B": np.abs((y - pb) / y) * 100}))
     r = pd.DataFrame(rows)
     r["ΔMAPE"] = r["MAPE_A"] - r["MAPE_B"]          # 正值 = B 比較好
+    r["ΔMdAPE"] = r["MdAPE_A"] - r["MdAPE_B"]
     if tag:
         print(f"[{tag}] MAPE_A {r.MAPE_A.mean():.2f}±{r.MAPE_A.std():.2f}"
               f"｜MAPE_B {r.MAPE_B.mean():.2f}±{r.MAPE_B.std():.2f}"
-              f"｜ΔMAPE {r['ΔMAPE'].mean():+.2f}±{r['ΔMAPE'].std():.2f} pp")
+              f"｜ΔMAPE {r['ΔMAPE'].mean():+.2f}±{r['ΔMAPE'].std():.2f}"
+              f"｜ΔMdAPE {r['ΔMdAPE'].mean():+.2f} pp")
     return r, pd.concat(errs, ignore_index=True)
 ''')
 
@@ -211,7 +258,10 @@ md(r"""
 """)
 
 code(r'''
-res, errs = run_ab(FEATS_A, FEATS_B, tag="主結果")
+# **雙口徑。** `keep=True` 同時要求「影像可用」，也就是評估集被影像品質挑過一遍
+# ——實測那讓 B 佔約 0.21 pp 的便宜。所以同時報「只要求 n_tx ≥ 3、讓 B 在影像缺失
+# 的 cell 上吃 NaN」這個較不利於 B 的口徑，兩者的差就是 selection 的敏感度。
+res, errs = run_ab(FEATS_A, FEATS_B, tag="主結果（keep：n_tx≥3 且影像可用）")
 print()
 print(res.round(3).to_string(index=False))
 print(f"\n測試集：{int((data.split == 'test').sum()):,} 列"
@@ -255,36 +305,82 @@ def paired_test(e: pd.DataFrame, by: list) -> dict:
     g = e.groupby(by)[["ape_A", "ape_B"]].mean()
     d = (g["ape_A"] - g["ape_B"]).dropna()
     if len(d) < 3:
-        return {"n_pair": len(d), "mean_diff": np.nan, "t": np.nan, "p": np.nan}
+        return {"n_pair": len(d), "mean_diff": np.nan, "t": np.nan, "p": np.nan,
+                "wilcoxon_p": np.nan}
     t, p = stats.ttest_rel(g["ape_A"], g["ape_B"])
     w = stats.wilcoxon(g["ape_A"], g["ape_B"])[1] if len(d) >= 10 else np.nan
     return {"n_pair": int(len(d)), "mean_diff": float(d.mean()),
             "t": float(t), "p": float(p), "wilcoxon_p": float(w)}
 
 
+def cluster_test(e: pd.DataFrame, n_boot: int = 4000, seed: int = 0) -> dict:
+    """**以單元為 cluster** 的檢定。這是主要的檢定，上面那個只當對照。
+
+    為什麼必須 cluster：以 (單元 × 季) 當獨立樣本會高估樣本數——同一單元不同季的
+    ΔAPE 高度相關（實測 ICC ≈ 0.56，188 個名目 pair 的有效樣本只有約 104）。
+    計畫 §5.3 只點名了「× 月」這個假複製，但「× 季」還有第二層假複製在單元上。
+    實測後果是決策性的：逐縣市的 p 值從 0.004 變成 0.073。
+    """
+    g = (e.groupby(["unit", "quarter"])[["ape_A", "ape_B"]].mean()
+          .assign(diff=lambda x: x["ape_A"] - x["ape_B"]).reset_index())
+    per_unit = g.groupby("unit")["diff"].mean().dropna()
+    if len(per_unit) < 3:
+        return {"n_cluster": len(per_unit), "mean_diff": np.nan, "p": np.nan,
+                "ci_lo": np.nan, "ci_hi": np.nan, "icc": np.nan}
+    t, p = stats.ttest_1samp(per_unit, 0.0)
+    # cluster bootstrap（重抽單元，不重抽季）
+    rng = np.random.default_rng(seed)
+    units = per_unit.index.to_numpy()
+    boot = np.array([per_unit.loc[rng.choice(units, len(units), replace=True)].mean()
+                     for _ in range(n_boot)])
+    # ICC：單元間變異 / 總變異
+    gm = g["diff"].mean()
+    ss_b = ((g.groupby("unit")["diff"].transform("mean") - gm) ** 2).sum()
+    ss_t = ((g["diff"] - gm) ** 2).sum()
+    return {"n_cluster": int(len(per_unit)), "n_cell": int(len(g)),
+            "mean_diff": float(per_unit.mean()), "t": float(t), "p": float(p),
+            "boot_p": float(2 * min((boot <= 0).mean(), (boot >= 0).mean())),
+            "ci_lo": float(np.percentile(boot, 2.5)),
+            "ci_hi": float(np.percentile(boot, 97.5)),
+            "icc": float(ss_b / ss_t) if ss_t > 0 else np.nan}
+
+
+errs["period"] = errs.get("period", errs["quarter"])
+overall_cl = cluster_test(errs)
 overall_q = paired_test(errs, ["unit", "quarter"])
-overall_m = paired_test(errs, ["unit", "quarter", "seed"])
-print("整體 paired t-test")
-print(f"  pairing = 單元 × 季（計畫指定）：n={overall_q['n_pair']}, "
-      f"mean diff {overall_q['mean_diff']:+.3f} pp, p={overall_q['p']:.4g}, "
-      f"Wilcoxon p={overall_q['wilcoxon_p']:.4g}")
-print(f"  pairing = 單元 × 季 × seed（**錯的**，seed 之間不獨立）："
-      f"n={overall_m['n_pair']}, p={overall_m['p']:.4g}")
-print("  ↑ 兩者的 n 差 10 倍、p 差好幾個數量級。這就是為什麼 pairing 單位要固定。")
+overall_mo = paired_test(errs, ["unit", "period_m"]) if "period_m" in errs else None
+overall_sd = paired_test(errs, ["unit", "quarter", "seed"])
+print("整體檢定——**由嚴到鬆**，用最嚴的那個下判斷")
+print(f"  ① 單元 cluster（主要）：n_cluster={overall_cl['n_cluster']}"
+      f"（{overall_cl['n_cell']} 個 cell）, mean {overall_cl['mean_diff']:+.3f} pp, "
+      f"p={overall_cl['p']:.4g}, bootstrap p={overall_cl['boot_p']:.4g}, "
+      f"95% CI [{overall_cl['ci_lo']:+.3f}, {overall_cl['ci_hi']:+.3f}], "
+      f"ICC={overall_cl['icc']:.3f}")
+print(f"  ② 單元 × 季（計畫指定，但同單元跨季相關）：n={overall_q['n_pair']}, "
+      f"p={overall_q['p']:.4g}")
+print(f"  ③ 單元 × 季 × seed（**錯的**，seed 不獨立）：n={overall_sd['n_pair']}, "
+      f"p={overall_sd['p']:.4g}")
+print(f"  ↑ ICC {overall_cl['icc']:.2f} 代表 ② 的名目 n 高估了有效樣本數。"
+      "計畫 §5.3 只點名「× 月」這一層假複製，單元上還有第二層。")
 
 rows = []
 for city, g in errs.groupby("縣市"):
-    r = paired_test(g, ["unit", "quarter"])
+    r = cluster_test(g, n_boot=2000)
     r["縣市"] = city
+    r["p_naive_cell"] = paired_test(g, ["unit", "quarter"])["p"]
     r["顯著改善"] = bool(r["p"] < 0.05 and r["mean_diff"] > 0)
     rows.append(r)
 city_test = pd.DataFrame(rows).set_index("縣市").reindex(
     [c for c in CITY_ORDER if c in {r["縣市"] for r in rows}])
-print("\n逐縣市 paired t-test（pairing = 單元 × 季）")
+print("\n逐縣市（p 為單元 cluster；p_naive_cell 為以 cell 當獨立樣本的對照）")
 print(city_test.round(4).to_string())
+_missing_city = [c for c in CITY_ORDER if c not in city_test.index]
+if _missing_city:
+    print(f"\n⚠️  測試集裡完全沒有這些縣市：{_missing_city}"
+          "——「≥ 3 個縣市」的分母因此不是 6，結論要標註。")
 n_sig = int(city_test["顯著改善"].sum())
 crit2 = bool(n_sig >= 3)
-print(f"\n成功標準 2（≥ 3 個縣市顯著改善）：{n_sig} 個 → "
+print(f"\n成功標準 2（≥ 3 個縣市顯著改善，單元 cluster）：{n_sig} 個 → "
       f"{'✅ 達成' if crit2 else '❌ 未達成'}")
 ''')
 
@@ -339,9 +435,34 @@ md(r"""
 code(r'''
 checks = {}
 
-# ---- N1：隨機雜訊對照 ----
-# 把影像特徵換成同維度的隨機雜訊。樹模型多拿到幾個特徵本身就可能讓 MAPE 稍好
-# （更多分裂機會）。若雜訊也能改善接近 2 pp，那成功標準 1 本身就沒有意義。
+# ---- N1：null 影像對照（主對照 = 單元輪換）----
+# 目的是問「同樣多、同樣長相的特徵，但**與這個單元無關**，能買到多少 MAPE？」
+#
+# 標準常態雜訊是不夠格的對照：它沒有時間自相關、沒有空間自相關、沒有 NaN 型態，
+# 樹模型對它的反應與對真實影像不同。實測標準常態**高估**了「加欄的代價」約 0.34 pp，
+# 於是 `net_d` 會系統性偏向支持影像假設。
+#
+# 主對照 **N1d 單元輪換**：把每個單元的影像時間序列整條換給另一個單元。
+# 邊際分布、時間自相關、NaN 型態全部保留，只錯配 unit ↔ 影像。
+# 若真實影像與「隔壁鄉鎮的影像」在統計上分不出來，那就沒有增量。
+_units = sorted(data["unit"].unique())
+_rot = {u: _units[(i + max(1, len(_units) // 3)) % len(_units)]
+        for i, u in enumerate(_units)}
+# 影像在同一季內是常數（NB2 的 M2 已驗證），所以先去重再建索引——
+# 房價是月粒度時每個 (unit, quarter) 有 3 列，直接 set_index 會是非唯一索引。
+_img_lookup = (data.drop_duplicates(subset=["unit", "quarter"])
+                   .set_index(["unit", "quarter"])[IMG_FEATS])
+d_rot = data.copy()
+_key = pd.MultiIndex.from_arrays([d_rot["unit"].map(_rot), d_rot["quarter"]])
+for f in IMG_FEATS:
+    d_rot[f] = _img_lookup[f].reindex(_key).to_numpy()
+print(f"N1d 單元輪換：影像值改成別的單元同季的值"
+      f"（輪換後仍有值的比例 {d_rot[IMG_FEATS].notna().all(axis=1).mean():.1%}）")
+res_n1, _ = run_ab(FEATS_A, FEATS_B, d=d_rot, n_seeds=N_SEEDS, tag="N1d 單元輪換（主對照）")
+checks["N1_unit_rotated"] = {"dMAPE_mean": round(float(res_n1["ΔMAPE"].mean()), 3),
+                             "dMAPE_sd": round(float(res_n1["ΔMAPE"].std()), 3)}
+
+# 次要對照：標準常態雜訊。保留它只是為了量「純粹多幾欄」的代價，不當主對照。
 rng = np.random.default_rng(0)
 d_noise = data.copy()
 noise_cols = []
@@ -349,23 +470,45 @@ for i, f in enumerate(IMG_FEATS):
     c = f"noise_{i}"
     d_noise[c] = rng.standard_normal(len(d_noise))
     noise_cols.append(c)
-res_n1, _ = run_ab(FEATS_A, FEATS_A + noise_cols, d=d_noise, n_seeds=5, tag="N1 隨機雜訊")
-checks["N1_noise"] = {"dMAPE_mean": round(float(res_n1["ΔMAPE"].mean()), 3),
-                      "dMAPE_sd": round(float(res_n1["ΔMAPE"].std()), 3)}
+res_n1b, _ = run_ab(FEATS_A, FEATS_A + noise_cols, d=d_noise, n_seeds=5,
+                    tag="N1b 標準常態雜訊（次要）")
+checks["N1b_gaussian"] = {"dMAPE_mean": round(float(res_n1b["ΔMAPE"].mean()), 3),
+                          "dMAPE_sd": round(float(res_n1b["ΔMAPE"].std()), 3)}
+
+# **同 seed、同資料的直接對照**：把 null 影像與真實影像放在同一次比較裡，
+# A 項才會抵銷掉（用兩組不同 seed 相減會多帶進 A 的變異）。
+_direct = []
+for sd in range(N_SEEDS):
+    p_null, _ = fit_predict(FEATS_B, sd, d_rot)
+    p_real, _ = fit_predict(FEATS_B, sd, data)
+    _y = data[data.split == "test"][TARGET].to_numpy()
+    _yn = d_rot[d_rot.split == "test"][TARGET].to_numpy()
+    _direct.append(mape(_yn, p_null) - mape(_y, p_real))
+net_direct = float(np.mean(_direct))
+checks["net_vs_null_direct"] = {"mean": round(net_direct, 3),
+                                "sd": round(float(np.std(_direct)), 3)}
+print(f"\n真實影像 vs 輪換影像（同 seed 直接對照）：{net_direct:+.3f} "
+      f"± {np.std(_direct):.3f} pp")
+print("  ↑ **這個數字才是「影像認得出自己的單元」的證據。** 接近 0 就代表認不出來。")
 ''')
 
 code(r'''
 # ---- N2：影像特徵在單元內時間打散 ----
 # 保留每個單元的影像分布（也就是保留空間固定效果），只破壞時間對應。
 # 若改善還在，那影像帶的是「哪個區」而不是「這個區在變」——後者才是計畫的假設。
+# **在 (單元 × split) 內打散，不跨切分邊界。** 跨邊界打散會讓測試集的影像值大量
+# 取自訓練期（實測 66.5%），使打散版看到的分布比真實情況更接近訓練期、
+# 人為讓對照組變好——實測 `time_d` 的符號就是由「跨不跨邊界」決定的（−0.05 vs +0.20）。
 d_shuf = data.copy()
 rs2 = np.random.default_rng(1)
 for f in IMG_FEATS:
-    d_shuf[f] = (d_shuf.groupby("unit")[f]
+    d_shuf[f] = (d_shuf.groupby(["unit", "split"])[f]
                        .transform(lambda s: rs2.permutation(s.to_numpy())))
-res_n2, _ = run_ab(FEATS_A, FEATS_B, d=d_shuf, n_seeds=5, tag="N2 單元內時間打散")
+res_n2, _ = run_ab(FEATS_A, FEATS_B, d=d_shuf, n_seeds=N_SEEDS,
+                   tag="N2 單元×split 內時間打散")
 checks["N2_shuffled"] = {"dMAPE_mean": round(float(res_n2["ΔMAPE"].mean()), 3),
-                         "dMAPE_sd": round(float(res_n2["ΔMAPE"].std()), 3)}
+                         "dMAPE_sd": round(float(res_n2["ΔMAPE"].std()), 3),
+                         "within": "unit×split（不跨邊界）"}
 ''')
 
 code(r'''
@@ -423,12 +566,41 @@ else:
     checks["N4_no_new_station"] = {"skipped": "OSM 沒有可用的 start_date"}
     print("N4 跳過：OSM 沒有可用的 start_date（這一項的偏誤因此沒有被排除，"
           "要寫在結論的限制裡）")
+# **不要因為跑了 N4 就當這個偏誤解決了。** 實測 900 個站只有 132 個（14.7%）有
+# start_date，窗口內約 60 站，最後只排除掉 5/102 個單元。這個偏誤**實質上仍然存在**，
+# 而且方向是偏袒影像。要真的排除需要交通部／各捷運公司的通車年表（六都的通車站
+# 是可窮舉的，幾十筆），那還沒做。
+checks["N4_no_new_station"]["coverage_warning"] = (
+    "OSM start_date 覆蓋率僅約 15%，此 robustness 只碰到少數單元，"
+    "「缺少通車前後特徵而偏袒影像」這個偏誤實質上未被排除")
 ''')
 
 code(r'''
+# ---- 特徵層敏感度（A0 / A1 / A2）----
+# 「A 怎麼定義」造成的 ΔMAPE 分散實測比 2 pp 的成功門檻還大，所以三層都要報，
+# 而且結論只在**符號一致**時才成立。
+tier_res = {}
+for name, fa in TIERS.items():
+    if not fa:
+        continue
+    rt, _ = run_ab(fa, fa + IMG_FEATS, n_seeds=5, tag=f"層 {name}（{len(fa)} 特徵）")
+    tier_res[name] = {"n_feats": len(fa),
+                      "dMAPE_mean": round(float(rt["ΔMAPE"].mean()), 3),
+                      "dMAPE_sd": round(float(rt["ΔMAPE"].std()), 3)}
+checks["feature_tiers"] = tier_res
+_signs = {k: np.sign(v["dMAPE_mean"]) for k, v in tier_res.items()}
+tier_consistent = len(set(_signs.values())) == 1
+print(f"\n三層的 ΔMAPE 符號是否一致：{tier_consistent}（{_signs}）")
+checks["tier_sign_consistent"] = bool(tier_consistent)
+
 # ---- N5：排除所得被遞延的年份 ----
-if "income_year_used" in data.columns and (data["income_year_used"] != data["year"]).any():
-    d_n5 = data[data["income_year_used"] == data["year"]]
+_IY = "income_source_year" if "income_source_year" in data.columns else "income_year_used"
+if _IY in data.columns and (data[_IY] != data["year"] - MM.get("income_lag_years", 0)).any():
+    # **只在 test 上排除**。把遞延列從所有 split 拿掉會同時砍掉訓練資料與測試窗口，
+    # 那樣就分不清「排除遞延」與「test 變短」哪個造成了差異。
+    _bad_test = ((data["split"] == "test")
+                 & (data[_IY] != data["year"] - MM.get("income_lag_years", 0)))
+    d_n5 = data[~_bad_test]
     if (d_n5["split"] == "test").sum() > 50:
         res_n5, _ = run_ab(FEATS_A, FEATS_B, d=d_n5, n_seeds=5, tag="N5 排除所得遞延年")
         checks["N5_income_actual"] = {
@@ -448,38 +620,67 @@ md(r"""
 """)
 
 code(r'''
-NOISE_TOL = 0.5      # 隨機雜訊帶來的 ΔMAPE 超過這個值，就代表「多特徵」本身有效果
+NOISE_TOL = 0.5
 main_d = float(res["ΔMAPE"].mean())
 main_sd = float(res["ΔMAPE"].std())
-noise_d = checks["N1_noise"]["dMAPE_mean"]
+main_se = main_sd / np.sqrt(len(res))
+null_d = checks["N1_unit_rotated"]["dMAPE_mean"]
 shuf_d = checks["N2_shuffled"]["dMAPE_mean"]
+n3 = checks.get("N3_quarterly", {})
 
-# 扣掉「多特徵」的效果之後，影像真正的增量
-net_d = main_d - noise_d
-# 扣掉「空間固定效果」之後，影像的**時間**訊號
+# 影像相對於「別的單元的影像」的淨增量（同 seed 直接對照，A 項已抵銷）
+net_d = checks["net_vs_null_direct"]["mean"]
 time_d = main_d - shuf_d
 
+# **null 結果與「有增量但對照失敗」是兩件不同的事，不能都叫 PARTIAL。**
+is_null = bool(abs(main_d) < 2 * main_se or main_d <= 0)
+controls = {}
+controls["null_imagery_small"] = bool(abs(null_d) < NOISE_TOL)
+controls["time_signal_positive"] = bool(time_d > NOISE_TOL)
+controls["net_vs_null_positive"] = bool(net_d > NOISE_TOL)
+controls["quarterly_same_sign"] = (
+    None if "skipped" in n3 else bool(np.sign(n3.get("dMAPE_mean", 0)) == np.sign(main_d)))
+controls["tier_sign_consistent"] = bool(checks.get("tier_sign_consistent", False))
+# 主結果是 null 的時候，「負對照有沒有過」本身沒有意義——不要印成「主結果不可信」
+controls_status = ("na_null_result" if is_null else
+                   "ok" if all(v for v in controls.values() if v is not None) else
+                   "failed")
+
+all_met = crit1 and crit2 and crit3
+n_met = int(crit1) + int(crit2) + int(crit3)
 verdict = {
     "criteria": {
         "1_mape_ge_2pp": {"target": 2.0, "actual": round(main_d, 3),
-                          "sd_across_seeds": round(main_sd, 3), "met": crit1},
-        "2_cities_significant": {"target": 3, "actual": n_sig, "met": crit2},
+                          "sd_across_seeds": round(main_sd, 3),
+                          "se": round(float(main_se), 3),
+                          "cluster_ci": [round(overall_cl["ci_lo"], 3),
+                                         round(overall_cl["ci_hi"], 3)],
+                          "met": crit1},
+        "2_cities_significant": {"target": 3, "actual": n_sig,
+                                 "cities_in_test": list(city_test.index),
+                                 "cities_missing": _missing_city, "met": crit2},
         "3_shap_top10": {"met": crit3,
                          "img_ranks": img_ranks.set_index("feature")["rank"].to_dict()},
     },
+    "n_criteria_met": n_met,
+    "controls": controls,
+    "controls_status": controls_status,
     "negative_controls": checks,
     "derived": {
-        "net_of_noise_pp": round(net_d, 3),
+        "net_vs_null_pp": round(net_d, 3),
         "time_signal_pp": round(time_d, 3),
+        "delta_mdape_pp": round(float(res["ΔMdAPE"].mean()), 3),
+        "is_null": is_null,
         "exceeds_seed_noise": bool(abs(main_d) > main_sd),
+        "mean_exceeds_2se": bool(abs(main_d) > 2 * main_se),
     },
 }
-all_met = crit1 and crit2 and crit3
-controls_ok = bool(noise_d < NOISE_TOL and shuf_d < main_d - NOISE_TOL)
-verdict["overall"] = ("SUPPORTED" if all_met and controls_ok else
-                      "NOT_SUPPORTED" if not any((crit1, crit2, crit3)) else
-                      "PARTIAL")
-verdict["controls_ok"] = controls_ok
+verdict["overall"] = (
+    "INVALID" if all_met and controls_status == "failed" else
+    "SUPPORTED" if all_met and controls_status == "ok" else
+    "NULL" if is_null and n_met == 0 else
+    "NOT_SUPPORTED" if n_met == 0 else
+    "PARTIAL")
 
 bar = "=" * 78
 print(bar)
@@ -494,13 +695,27 @@ print(f"  成功標準 1（ΔMAPE ≥ 2 pp）        ：{'✅' if crit1 else '�
 print(f"  成功標準 2（≥ 3 縣市顯著）        ：{'✅' if crit2 else '❌'}  實得 {n_sig}")
 print(f"  成功標準 3（影像進 SHAP 前 10）   ：{'✅' if crit3 else '❌'}")
 print()
-print(f"  負對照 N1 隨機雜訊  ΔMAPE {noise_d:+.3f} pp"
-      f"   → 扣掉後影像的淨增量 {net_d:+.3f} pp")
-print(f"  負對照 N2 時間打散  ΔMAPE {shuf_d:+.3f} pp"
-      f"   → 其中屬於**時間訊號**的 {time_d:+.3f} pp")
-print(f"  負對照是否過關：{'✅' if controls_ok else '❌ —— 主結果不可信'}")
+print(f"  ΔMdAPE  {res['ΔMdAPE'].mean():+6.3f} pp"
+      f"   （中位數口徑；MAPE 有 46% 來自最高價的 1/4 cell）")
+print(f"  單元 cluster 95% CI [{overall_cl['ci_lo']:+.3f}, {overall_cl['ci_hi']:+.3f}]"
+      f"  ICC {overall_cl['icc']:.2f}")
 print()
+print(f"  N1d 單元輪換（主對照）ΔMAPE {null_d:+.3f} pp")
+print(f"  真實影像 vs 輪換影像（同 seed）：{net_d:+.3f} pp"
+      f"   ← **影像認不認得出自己的單元**")
+print(f"  N2 時間打散         ΔMAPE {shuf_d:+.3f} pp"
+      f"   → 屬於時間訊號的 {time_d:+.3f} pp")
+if "skipped" not in n3:
+    print(f"  N3 季粒度           ΔMAPE {n3['dMAPE_mean']:+.3f} pp"
+          f"   {'（符號與主結果一致）' if controls['quarterly_same_sign'] else '（**符號相反**）'}")
+print(f"  三層特徵符號一致：{controls['tier_sign_consistent']}")
+print(f"  負對照狀態：{controls_status}"
+      + ("  （主結果是 null，負對照不適用）" if controls_status == "na_null_result" else ""))
+print()
+print(f"  達成的成功標準：{n_met} / 3")
 print(f"  結論：**{verdict['overall']}**")
+print("  註：SUPPORTED=三條全過且負對照通過｜INVALID=三條全過但負對照失敗"
+      "｜NULL=沒有增量｜PARTIAL=部分達成")
 print(bar)
 
 (PROC / "modeling_result.json").write_text(
@@ -519,6 +734,9 @@ print(bar)
                 "overall_paired_test_quarter": {
                     k: (None if pd.isna(v) else v) for k, v in overall_q.items()},
                 "verdict": verdict,
+                "delta_mape_by_seed": res["ΔMAPE"].round(4).tolist(),
+                "cluster_test": {k: (None if pd.isna(v) else v)
+                                 for k, v in overall_cl.items()},
                 "inherited_biases": MM["known_biases"]},
                ensure_ascii=False, indent=1), encoding="utf-8")
 print(f"已寫出 {PROC / 'modeling_result.json'}")
