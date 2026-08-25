@@ -201,6 +201,13 @@ COVERAGE_MIN_RATIO = 0.40   # 月交易量 / 置中 13 個月滾動中位數 的
 # 3.2–3.5×，餘裕很足。所以上升門檻另外設在 2.5，換掉那段誤報空間。
 STEP_RATIO = 0.55
 STEP_UP_RATIO = 2.5
+# Layer 2a‴ 用**另一組**門檻。2b′ 跑的是 raw 的全型態總量，沒有型態組成的趨勢曝險；
+# 2a‴ 跑的是逐型態的筆數，而真實資料上「公寓」正在長期衰退——實測下降側六都全部
+# 由公寓把持最低值（臺中 0.681、桃園/臺南 0.707、高雄 0.708），對 0.55 只有 1.24 倍餘裕。
+# 而且 level_shift 的最後一個切點只用最後 4 季當後段，SEASONS 往後延長時餘裕會繼續縮
+# （公寓全國逐季命中數已從峰值 8,642 掉到 3,972）。這跟舊版 2a′ 被臺南趨勢誤報是同一種病。
+GROUP_STEP_DOWN = 0.45
+GROUP_STEP_UP = 2.5
 
 # Layer 2a″（建物型態前綴的逐季普查）
 # 某前綴連續這麼多季零命中就判定為「來源用語從那一季起改掉了」。
@@ -521,6 +528,7 @@ def roc_to_datetime(s: pd.Series) -> pd.Series:
     )
 
 
+_WARNED_ABSENT: set = set()   # 只對前幾個檔印「期待卻不存在的欄名」，不要洗版
 LOAD_STATS: list = []      # 每個 csv 的列數保留情況，§3.2 Layer 2a′ 使用
 # 建物型態的原始用語普查（在型態篩選**之前**），§3.2 Layer 2a″／2a‴ 使用。
 # key 是 (發布季, 縣市, 建物型態)：
@@ -556,6 +564,14 @@ def load_one(path: Path) -> Optional[pd.DataFrame]:
         return None
 
     use = [orig for orig, new in zip(head.columns, renamed) if new in USE_COLS]
+    # 反向訊號：USE_COLS 要的欄名而來源沒有。少了這個，「衍生欄從 DERIVED_COLS 漏掉」
+    # 會完全靜默（那個名字進了 USE_COLS，但 CSV 裡沒有，過濾器直接略過）。
+    _absent = sorted(set(USE_COLS) - set(renamed))
+    if _absent and path.name not in _WARNED_ABSENT:
+        _WARNED_ABSENT.add(path.name)
+        if len(_WARNED_ABSENT) <= 3:
+            print(f"  ℹ️  {path.name}：USE_COLS 期待但來源沒有的欄名 {_absent}"
+                  "（若那是清整產生的衍生欄，要加進 §0 的 DERIVED_COLS）")
     try:
         df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", low_memory=False,
                          usecols=use)
@@ -896,6 +912,8 @@ p90 由後段的高季決定 → 前段每一季都變成「p90 的 56–60%」�
 | 仍然抓不到的形狀 | 為什麼 |
 |---|---|
 | 全窗口等比例少算 25% 以內 | Layer 4 的絕對下限即使照實測校準（0.61），實測解析度也只有 30% |
+| 型態用語部分改版但只掉 < 45% | 2a′ 挖空基準的偵測深度下限是 45%（掉 30% → 比值約 0.70，門檻 0.55 接不到） |
+| 單一縣市、**只有 1–3 季**、掉一半 | 實測十層全綠。真實的單季變異（主型態佔比局部最小 0.659）比這個訊號還大，任何門檻都分不開。絕對量小（約佔全國主型態 0.6%）且集中在少數月，是刻意接受的殘留 |
 | 每年重複出現的長缺口 | 局部基準沉下去、跨年基準被翻轉；滾動四季比值也一起沉，只有絕對水準接得到 |
 | 型態用語**全 36 季一起**部分改版 | 2a″ 要恰好 0、2a‴ 要有階梯、2a′ 的局部基準會一起沉。需要「某型態應佔住宅子集多少」這種絕對先驗才擋得住，目前沒有 |
 | 官方表的口徑變更 | 算術恆等式與表級合理性檢查都驗不出來，會表現成 Layer 4 全縣市同時偏移 |
@@ -962,15 +980,66 @@ RESI_WIN = 7
 RESI_LOCAL_MIN = 0.60          # 住宅類佔比（三組聯集）
 MAIN_LOCAL_MIN = 0.45          # 主型態佔比（只有 MAIN_GROUPS，Y 真正用到的那一組）
 
+# 置中滾動中位數有一個**純算術**的盲區：窗口 7、median 是第 4 小，所以只要缺口連續
+# 佔滿 4 季以上，窗口內就有 ≥4 個缺口值 → median 本身就是缺口值 → 比值恰好 1.000，
+# **與缺口深度完全無關**（掉 99% 也是 1.000）。而宣稱要接手的 2a‴ 對「中段」的缺口
+# 同樣是盲的（level_shift 比的是切點前後的中位數，中段一段不動任何一側）。
+# 所以「連續 4–12 季、任意深度」在只有 local 基準時是一條完整的盲帶。
+#
+# 補法：另一支基準只用「距離 PUNCH_INNER+1 ~ PUNCH_OUTER 季」的鄰居、**挖掉自己附近**。
+# 對長度 ≤ 2×PUNCH_INNER+1 的缺口免疫（缺口全落在被挖掉的範圍內），
+# 但仍然是局部的，對長期趨勢仍免疫。
+#
+# (7, 16) 是掃出來的。真實資料的誤報餘裕 vs 注入「臺中住宅大樓 -50%、連續 N 季」的偵測值：
+#
+# | inner/outer | 真實最小(主型態) | gap4 | gap6 | gap10 |
+# |---|---|---|---|---|
+# | 3/9   | 0.708 | 0.513 | 0.513 | 0.585 |  ← 偵測值隨缺口變長而升高
+# | 5/16  | 0.711 | 0.499 | 0.499 | 0.538 |
+# | **7/16** | **0.696** | **0.499** | **0.499** | **0.499** |  ← 偵測值與缺口長度無關
+# | 7/20  | 0.671 | 0.514 | 0.514 | 0.514 |
+# | 9/20  | 0.653 | 0.506 | 0.506 | 0.506 |  ← 誤報餘裕開始掉
+#
+# 7/16 幾乎不花誤報餘裕（0.708 → 0.696）就讓偵測力**不再隨缺口長度衰減**。
+PUNCH_INNER, PUNCH_OUTER = 7, 16
+PUNCH_MIN_N = 4                # 挖空後至少要有這麼多鄰居才算得出基準
+# 挖空基準的門檻**和局部基準分開**，因為兩支的誤報側完全不同（實測最小值：
+# 局部 住宅類 0.840 / 主型態 0.659；挖空 住宅類 0.744 / 主型態 0.696）。
+RESI_PUNCH_MIN = 0.60          # 住宅類（餘裕 1.24×）
+MAIN_PUNCH_MIN = 0.55          # 主型態（餘裕 1.27×），偵測「掉 ≥ 45%」
+# 為什麼偵測要靠**主型態**而不是住宅類：住宅大樓只佔住宅子集約 67%，所以
+# 「住宅大樓 -50%」在住宅類佔比上只剩 -33%。實測住宅類挖空的偵測值 0.730 而
+# 誤報最小值 0.744——中間只有 0.014 的縫，**任何門檻都做不到**。
+# 這正是這一版把「主型態佔比」單獨拉出來量的理由。
+
 
 def local_ratio(g: pd.Series) -> pd.Series:
-    """同一縣市的季序列 → 「本季 / 鄰近 RESI_WIN 季（含自己）的中位數」。"""
+    """本季 / 鄰近 RESI_WIN 季（含自己）的中位數。對趨勢免疫、對短缺口敏銳。"""
     base = g.rolling(RESI_WIN, center=True, min_periods=3).median()
     return g / base.replace(0, np.nan)
 
 
+def punched_ratio(g: pd.Series) -> pd.Series:
+    """本季 / 「距離 PUNCH_INNER+1 ~ PUNCH_OUTER 季」鄰居的中位數（挖掉自己附近）。
+    這一支的存在理由是 local_ratio 對連續 ≥4 季的缺口恆等於 1.000（見上方說明）。"""
+    v = g.to_numpy(dtype=float)
+    n = len(v)
+    out = np.full(n, np.nan)
+    for i in range(n):
+        lo, hi = max(0, i - PUNCH_OUTER), min(n, i + PUNCH_OUTER + 1)
+        idx = [j for j in range(lo, hi) if abs(j - i) > PUNCH_INNER]
+        nb = v[idx]
+        nb = nb[np.isfinite(nb)]
+        if len(nb) >= PUNCH_MIN_N:
+            base = float(np.median(nb))
+            if base > 0:
+                out[i] = v[i] / base
+    return pd.Series(out, index=g.index)
+
+
 for _c in ("住宅類佔比", "主型態佔比"):
     ls[_c + "_local"] = ls.groupby("縣市")[_c].transform(local_ratio)
+    ls[_c + "_punch"] = ls.groupby("縣市")[_c].transform(punched_ratio)
 
 print("列數保留率（各縣市）\n")
 print(ls.groupby("縣市")
@@ -980,20 +1049,37 @@ print(ls.groupby("縣市")
              住宅類佔比中位=("住宅類佔比", "median"),
              住宅類佔比最大=("住宅類佔比", "max"),
              住宅類局部最小=("住宅類佔比_local", "min"),
+             住宅類挖空最小=("住宅類佔比_punch", "min"),
              主型態佔比最小=("主型態佔比", "min"),
-             主型態局部最小=("主型態佔比_local", "min"))
+             主型態局部最小=("主型態佔比_local", "min"),
+             主型態挖空最小=("主型態佔比_punch", "min"))
         .reindex(CITY_ORDER).round(3).to_string())
-print(f"\n門檻校準參考：住宅類局部最小離 {RESI_LOCAL_MIN}、主型態局部最小離"
-      f" {MAIN_LOCAL_MIN} 越近，誤判風險越高（真實資料實測 0.840 / 0.659）。")
+print(f"\n門檻校準參考（真實資料實測：局部 0.840/0.659、挖空 0.744/0.696）：")
+print(f"  局部 住宅類 {RESI_LOCAL_MIN}／主型態 {MAIN_LOCAL_MIN}；"
+      f"挖空 住宅類 {RESI_PUNCH_MIN}／主型態 {MAIN_PUNCH_MIN}。越接近越容易誤報。")
+print("  **偵測「連續數季各掉一半」靠的是主型態的挖空那一支**"
+      "（局部基準對連續 ≥4 季恆等於 1.000，住宅類則被稀釋到偵測不到）。")
 print("  「佔比最小/最大」差得遠**不再**是問題（那是長期趨勢，局部基準對它免疫）；")
 print(f"  但若有縣市的局部最小低於門檻 + 0.10，門檻就得放寬。")
 
+# 兩支相對基準任一中標就報。**兩支都算不出來（全 NaN）也要中標**——
+# 短 SEASONS 時 min_periods 讓 _local 全是 NaN，舊版沒 guard 它，於是相對檢查
+# 整支靜默失效卻照樣印 ✅。
+_rel_cols = ["住宅類佔比_local", "住宅類佔比_punch", "主型態佔比_local", "主型態佔比_punch"]
+_rel_min = {"住宅類佔比_local": RESI_LOCAL_MIN, "住宅類佔比_punch": RESI_PUNCH_MIN,
+            "主型態佔比_local": MAIN_LOCAL_MIN, "主型態佔比_punch": MAIN_PUNCH_MIN}
 _bad = ((ls["日期格式率"] < DATE_MIN) | (ls["日期解析率"] < DATE_MIN)
         | (ls["住宅類佔比"] < RESI_FLOOR) | (ls["主型態佔比"] < MAIN_FLOOR)
-        | (ls["住宅類佔比_local"] < RESI_LOCAL_MIN)
-        | (ls["主型態佔比_local"] < MAIN_LOCAL_MIN)
         | ls["日期格式率"].isna() | ls["日期解析率"].isna()
         | ls["住宅類佔比"].isna() | ls["主型態佔比"].isna())
+for _c in _rel_cols:
+    _bad = _bad | (ls[_c] < _rel_min[_c])
+n_rel_checked = int(ls[_rel_cols].notna().any(axis=1).sum())
+if n_rel_checked < len(ls):
+    print(f"⚠️  {len(ls) - n_rel_checked} 個檔案算不出任何相對基準"
+          f"（季數太少：需要 local ≥ 3 個鄰居或 punch ≥ {PUNCH_MIN_N} 個）"
+          "——那些檔案的相對檢查等於沒跑，已計入失敗。")
+    _bad = _bad | ls[_rel_cols].notna().sum(axis=1).eq(0)
 bad_ret = ls[_bad]
 if len(bad_ret):
     coverage_fail(
@@ -1001,9 +1087,11 @@ if len(bad_ret):
         "\n".join([f"    {r['檔名']}：{r['原始列數']:,} 列 → 格式合法 {r['日期格式合法']:,}"
                    f"（{r['日期格式率']:.1%}）→ 可解析 {r['日期可解析']:,}"
                    f"（{r['日期解析率']:.1%}）→ 住宅類 {r['住宅類']:,}"
-                   f"（佔比 {r['住宅類佔比']:.1%}、局部 {r['住宅類佔比_local']:.0%}）"
+                   f"（佔比 {r['住宅類佔比']:.1%}、局部 {r['住宅類佔比_local']:.0%}"
+                   f"、挖空 {r['住宅類佔比_punch']:.0%}）"
                    f"、主型態 {r['主型態']:,}"
-                   f"（佔比 {r['主型態佔比']:.1%}、局部 {r['主型態佔比_local']:.0%}）"
+                   f"（佔比 {r['主型態佔比']:.1%}、局部 {r['主型態佔比_local']:.0%}"
+                   f"、挖空 {r['主型態佔比_punch']:.0%}）"
                    for _, r in bad_ret.sort_values("檔名").head(30).iterrows()] +
                   ([f"    …另有 {len(bad_ret) - 30} 個"] if len(bad_ret) > 30 else []) +
                   ["",
@@ -1013,12 +1101,17 @@ if len(bad_ret):
                    "住宅類／主型態**佔比**低於絕對下限 → 建物型態的用語整批對不上，"
                    "看 Layer 2a″ 的逐季普查表。",
                    "**局部**比值偏低 → 那幾季突然掉下去（基準是鄰近 "
-                   f"{RESI_WIN} 季的中位數，對長期趨勢免疫；門檻 住宅類 "
-                   f"{RESI_LOCAL_MIN}／主型態 {MAIN_LOCAL_MIN}）。",
+                   f"{RESI_WIN} 季的中位數）。",
+                   "**挖空**比值偏低 → 連續好幾季一起掉（基準挖掉自己 ±"
+                   f"{PUNCH_INNER} 季、只用距離 {PUNCH_INNER + 1}–{PUNCH_OUTER} 季的鄰居；"
+                   "局部基準對連續 ≥4 季的缺口恆等於 1.000，這一支專門補那個盲區）。",
+                   f"（門檻：局部 住宅類 {RESI_LOCAL_MIN}／主型態 {MAIN_LOCAL_MIN}；"
+                   f"挖空 住宅類 {RESI_PUNCH_MIN}／主型態 {MAIN_PUNCH_MIN}）",
                    "這些都會讓對應的交易月被系統性少算，而統計量看起來完全正常。"]))
 else:
     print(f"\n✅ Layer 2a′：{len(ls)} 個檔案的日期率與型態佔比都正常"
-          f"（局部基準 {RESI_WIN} 季、門檻 {RESI_LOCAL_MIN}/{MAIN_LOCAL_MIN}）")
+          f"（局部 {RESI_WIN} 季門檻 {RESI_LOCAL_MIN}/{MAIN_LOCAL_MIN}；"
+          f"挖空 ±{PUNCH_INNER}–{PUNCH_OUTER} 季門檻 {RESI_PUNCH_MIN}/{MAIN_PUNCH_MIN}）")
 ''')
 
 code(r'''
@@ -1043,6 +1136,7 @@ if not BUILDING_SEEN:
     hits = {g: 0 for g in BUILDING_GROUPS}
     prefix_hits = {p: 0 for p in BUILDING_RELAXED}
     dead_groups = list(BUILDING_GROUPS)
+    dead_prefixes_in_groups = list(BUILDING_RELAXED)
     prefix_runs, prefix_thin = [], []
     grp_season = pd.DataFrame(columns=list(BUILDING_GROUPS))
     grp_city_season = pd.DataFrame()
@@ -1091,6 +1185,15 @@ else:
     print(grp_season.T.to_string())
 
     dead_groups = [g for g, n in hits.items() if n == 0]
+    # 組內「全期零命中」的單一前綴：**刻意不當成失敗**——移到「組」語意的重點就是
+    # 允許前綴半死（改版後新舊用語各只在半段序列出現），而「預先登記未來用語」
+    # 也是合法用法。但完全沒有出口就無法跟「打錯字」區分，所以印出來。
+    dead_prefixes_in_groups = [p_ for p_, n in prefix_hits.items() if n == 0]
+    if dead_prefixes_in_groups:
+        print(f"\n⚠️  {len(dead_prefixes_in_groups)} 個前綴全期零命中："
+              f"{dead_prefixes_in_groups}")
+        print("    不當成失敗（可能是預先登記的未來用語）。但如果不是刻意的，"
+              "那就是打錯字——真實改版的舊前綴在前段一定還有命中數，不會是 0。")
 
     def zero_runs(v: np.ndarray) -> list:
         """零值的連續區間 [(起位置, 迄位置)]，兩端皆含。
@@ -1170,7 +1273,7 @@ code(r'''
 # 這一層對每個 (縣市 × 組) 的季命中數跑 Layer 2b′ 的 level_shift，實測接得到 f ≥ 0.45。
 # 用**筆數**而不是佔比：臺南的住宅類佔比八年間從 0.29 漲到 0.50（真實市場變化），
 # 佔比序列會誤報；筆數的前後段中位數比實測 1.6–1.9 倍，離上升門檻仍有餘裕。
-grp_steps, grp_thin, grp_extremes = [], [], []
+grp_steps, grp_thin, grp_extremes, grp_unchecked = [], [], [], []
 if len(grp_city_season):
     for city in CITY_ORDER:
         if city not in grp_city_season.index.get_level_values("縣市"):
@@ -1182,12 +1285,15 @@ if len(grp_city_season):
                 grp_thin.append({"縣市": city, "組": g, "季 p90": round(p90, 1)})
                 continue
             if len(v) < 8:
-                continue                  # level_shift 兩側各需 4 點
+                # level_shift 兩側各需 4 點。**要記帳**：不記的話短 SEASONS 下
+                # 每個組合都被跳過，卻印出「✅ 0 個序列均無持續性階梯」。
+                grp_unchecked.append({"縣市": city, "組": g, "季數": len(v)})
+                continue
             down, up = level_shift(v)
             if down:
                 grp_extremes.append({"縣市": city, "組": g, "方向": "下降",
                                      "比值": round(down[3], 3)})
-                if down[3] < STEP_RATIO:
+                if down[3] < GROUP_STEP_DOWN:
                     grp_steps.append({"縣市": city, "組": g,
                                       "切點季": seasons_seen[down[0]],
                                       "前段中位": round(down[1], 1),
@@ -1196,7 +1302,7 @@ if len(grp_city_season):
             if up:
                 grp_extremes.append({"縣市": city, "組": g, "方向": "上升",
                                      "比值": round(up[3], 3)})
-                if up[3] > STEP_UP_RATIO:
+                if up[3] > GROUP_STEP_UP:
                     grp_steps.append({"縣市": city, "組": g,
                                       "切點季": seasons_seen[up[0]],
                                       "前段中位": round(up[1], 1),
@@ -1205,18 +1311,29 @@ if len(grp_city_season):
 
     _ex = pd.DataFrame(grp_extremes)
     if len(_ex):
-        print(f"(縣市 × 組) 季序列的階梯極值（門檻：下降 {STEP_RATIO}、"
-              f"上升 {STEP_UP_RATIO}）\n")
+        print(f"(縣市 × 組) 季序列的階梯極值（門檻：下降 {GROUP_STEP_DOWN}、"
+              f"上升 {GROUP_STEP_UP}）\n")
         print(_ex.pivot_table(index="縣市", columns=["組", "方向"], values="比值")
                  .reindex(CITY_ORDER).round(3).to_string())
         print("\n門檻校準參考：上表的「下降」離 "
-              f"{STEP_RATIO}、「上升」離 {STEP_UP_RATIO} 越近，誤判風險越高。"
-              "真實市場變化造成的比值實測在 1.6–1.9 之間。")
+              f"{GROUP_STEP_DOWN}、「上升」離 {GROUP_STEP_UP} 越近，誤判風險越高。"
+              "\n  真實資料實測：上升最大 1.885（臺南華廈）、"
+              "下降最小 0.681（臺中公寓，公寓長期衰退）。"
+              "\n  **下降側會隨 SEASONS 延長繼續縮**（公寓還在跌），每次延長窗口都要回頭看這張表。")
     if grp_thin:
         print(f"\n量太小、跳過階梯檢查的組合 {len(grp_thin)} 個"
               f"（季 p90 < {PREFIX_MIN_MEDIAN}）："
               + "、".join(f"{r['縣市']}{r['組']}({r['季 p90']:.0f})" for r in grp_thin[:12])
               + (" …" if len(grp_thin) > 12 else ""))
+
+if grp_unchecked and not grp_steps:
+    coverage_fail(
+        f"❌ Layer 2a‴：{len(grp_unchecked)} 個（縣市 × 組）季數不足 8，階梯檢查沒跑",
+        "\n".join([f"    {r['縣市']} {r['組']}：只有 {r['季數']} 季"
+                    for r in grp_unchecked[:12]] +
+                   ["", "level_shift 兩側各需 4 個點。SEASONS 太短時這一層等於沒有——",
+                    "而它擋的是『型態用語部分改版』，是十層裡唯一接得到那個形狀的。",
+                    "要嘛把 SEASONS 補齊，要嘛明確接受（COVERAGE_STRICT=False）。"]))
 
 if grp_steps:
     coverage_fail(
@@ -1230,7 +1347,8 @@ if grp_steps:
                    "所以殘留一點舊用語就會從那裡溜過去，只有這一層接得到。",
                    "先看 Layer 2a″ 印的逐季命中表與全域用語表，確認來源改成了什麼；",
                    "若確認是真實的市場變化（例如某縣市某型態的供給結構改變），",
-                   f"把 STEP_RATIO（{STEP_RATIO}）／STEP_UP_RATIO（{STEP_UP_RATIO}）放寬，",
+                   f"把 GROUP_STEP_DOWN（{GROUP_STEP_DOWN}）／"
+                   f"GROUP_STEP_UP（{GROUP_STEP_UP}）放寬，",
                    "但要先看上面印的極值表確認新門檻的餘裕。",
                    "切點只是「落差最大的分割位置」，實測會偏移最多 5 季。"]))
 elif len(grp_city_season):
@@ -1310,9 +1428,13 @@ code(r'''
 # ---- Layer 2b′：季序列的持續性階梯落差 ----
 # level_shift 定義在 §0（Layer 2a‴ 比這裡更早用到它）
 # STEP_RATIO / STEP_UP_RATIO 定義在 §0（Layer 2a‴ 比這裡更早用到）
-steps = []
+steps, steps_unchecked = [], []
 for c in list(CITY_ORDER) + ["六都合計"]:
     series = sc.sum(axis=1) if c == "六都合計" else sc[c]
+    if len(series) < 8:
+        # 同 2a‴：不記帳的話短 SEASONS 下整層靜默失效卻印綠燈
+        steps_unchecked.append(c)
+        continue
     down, up = level_shift(series.to_numpy(dtype=float))
     if down and down[3] < STEP_RATIO:
         steps.append((c, SEASONS[down[0]], down[1], down[2], "該季起偏低"))
@@ -1331,8 +1453,13 @@ if steps:
                    "切點只是「落差最大的分割位置」，實測會偏移最多 5 季"
                    "（受影響季數離全長一半越遠、偏得越多）；",
                    "要精確定位是哪幾季，看 Layer 2a′ 逐檔列出的保留率。"]))
+elif steps_unchecked:
+    coverage_fail(
+        f"❌ Layer 2b′：{len(steps_unchecked)} 個序列的季數不足 8，階梯檢查沒跑",
+        f"    {steps_unchecked}\n"
+        "    level_shift 兩側各需 4 個點。SEASONS 太短時這一層等於沒有。")
 else:
-    print(f"✅ Layer 2b′：7 個季序列均無持續性落差"
+    print(f"✅ Layer 2b′：{len(CITY_ORDER) + 1} 個季序列均無持續性落差"
           f"（下降門檻 {STEP_RATIO:.0%}、上升門檻 {STEP_UP_RATIO:.1f}×）")
 ''')
 
@@ -1717,6 +1844,23 @@ else:
         seasons_cmp = [ss for ss in SEASONS if bool(both.loc[ss].any())]
         anchor["seasons_compared"] = seasons_cmp
 
+        # **「整個縣市一格都對不到」與「官方最後幾個月還沒發布」要分開判。**
+        # 前者只可能是解析壞了（縣市名用字改了、版面變了），不可能是官方延遲；
+        # 而它偏偏會讓 cover 掉到 0.80 以下 → 走進 insufficient → 只印警告。
+        # 也就是「壞 1 個縣市會中止、壞 6 個縣市只警告」——嚴重度反轉。
+        _dead_cities = [c for c in CITY_ORDER if not bool(both[c].any())]
+        anchor["cities_no_official"] = _dead_cities
+        if _dead_cities:
+            anchor["status"] = "failed"
+            coverage_fail(
+                f"❌ Layer 4：{len(_dead_cities)} 個縣市在官方資料裡一格都對不到："
+                f"{'、'.join(_dead_cities)}",
+                "\n".join([
+                    "    官方只是「最後幾個月還沒發布」的話，掉的是**季**不是**縣市**。",
+                    "    整個縣市對不到，只可能是縣市名對不上（臺/台 用字）或版面改了。",
+                    f"    官方表實際出現的縣市：{sorted(official['縣市'].unique())[:12]}",
+                    f"    我們要找的：{list(CITY_ORDER)}"]))
+
         # ---- 涵蓋率閘門 ----
         # 沒有這道閘門的話，只要 3 個發布季可比（18/216 = 8.3% 的格子）就會印 ✅，
         # 而 rel 與 step 兩支根本沒跑。實測「官方年份表頭改用語」只要打到 8/10 張
@@ -1784,6 +1928,9 @@ else:
                 med = float(sr.median()) if len(sr) else np.nan
                 row = {"點數": len(sr), "中位": med,
                        "最小/中位": (float(sr.min()) / med if len(sr) and med > 0 else np.nan),
+                       # 上界也要印。判定式是雙邊的（vv > med / ANCHOR_REL_MIN），
+                       # 但舊版只印下界的校準值——整份設計的原則是每個門檻都要看得到餘裕。
+                       "最大/中位": (float(sr.max()) / med if len(sr) and med > 0 else np.nan),
                        "階梯下降": np.nan, "階梯上升": np.nan}
                 v = sr.to_numpy(dtype=float)
                 if len(sr) >= 8 and med > 0:
@@ -1826,9 +1973,12 @@ else:
             print(f"\n{ANCHOR_ROLL} 季滾動比值（門檻：相對下限 {ANCHOR_REL_MIN:.0%}、"
                   f"階梯 {ANCHOR_STEP_DOWN}/{ANCHOR_STEP_UP}）\n")
             print(pd.DataFrame(_rep).T.reindex(CITY_ORDER).round(3).to_string())
-            print("門檻校準參考：「最小/中位」離 "
-                  f"{ANCHOR_REL_MIN} 越近、「階梯下降」離 {ANCHOR_STEP_DOWN} 越近、"
+            print(f"門檻校準參考：「最小/中位」離 {ANCHOR_REL_MIN} 越近、"
+                  f"「最大/中位」離 {1 / ANCHOR_REL_MIN:.3f} 越近、"
+                  f"「階梯下降」離 {ANCHOR_STEP_DOWN} 越近、"
                   f"「階梯上升」離 {ANCHOR_STEP_UP} 越近，誤判風險越高。")
+            print("  真實資料實測：階梯下降最小 0.882（臺南）→ 對 0.75 的餘裕是 **17.6%**，"
+                  "不是合成資料量到的 23%（那個數字來自上升側）。最緊的是下降側。")
             anchor["roll_report"] = {
                 c: {k: (None if pd.isna(v) else round(float(v), 4)) for k, v in r.items()}
                 for c, r in _rep.items()}
@@ -2023,6 +2173,10 @@ coverage = {
     "resi_local_window": RESI_WIN,
     "resi_local_min": RESI_LOCAL_MIN,
     "main_local_min": MAIN_LOCAL_MIN,
+    "punch_window": [PUNCH_INNER, PUNCH_OUTER],
+    "resi_punch_min": RESI_PUNCH_MIN,
+    "main_punch_min": MAIN_PUNCH_MIN,
+    "n_rel_checked": n_rel_checked,
     # 門檻校準用。**看 local_min 不要看 min/max**：真實資料上臺南的住宅類佔比
     # 八年間從 0.29 漲到 0.50，min/max 比值 0.52 是真實趨勢而非缺陷——這正是
     # 舊版用全期 p90 當基準會誤報 4 個檔案的原因。局部基準對趨勢免疫。
@@ -2031,9 +2185,11 @@ coverage = {
         c: {"住宅類_min": _cov_num(g["住宅類佔比"].min()),
             "住宅類_max": _cov_num(g["住宅類佔比"].max()),
             "住宅類_local_min": _cov_num(g["住宅類佔比_local"].min()),
+            "住宅類_punch_min": _cov_num(g["住宅類佔比_punch"].min()),
             "主型態_min": _cov_num(g["主型態佔比"].min()),
             "主型態_max": _cov_num(g["主型態佔比"].max()),
-            "主型態_local_min": _cov_num(g["主型態佔比_local"].min())}
+            "主型態_local_min": _cov_num(g["主型態佔比_local"].min()),
+            "主型態_punch_min": _cov_num(g["主型態佔比_punch"].min())}
         for c, g in ls.groupby("縣市")},
     "n_seasons": len(SEASONS),
     "n_files": len(files),
@@ -2041,8 +2197,9 @@ coverage = {
     "failed_files": load_failed,
     "bad_retention": _jsonable(
         bad_ret[["檔名", "原始列數", "日期格式率", "日期解析率",
-                 "住宅類佔比", "住宅類佔比_local",
-                 "主型態佔比", "主型態佔比_local"]].round(3).to_dict("records")),
+                 "住宅類佔比", "住宅類佔比_local", "住宅類佔比_punch",
+                 "主型態佔比", "主型態佔比_local",
+                 "主型態佔比_punch"]].round(3).to_dict("records")),
     "bad_season_city": [{"發布季": ss, "縣市": c, "筆數": n, "季中位": round(b, 1)}
                         for ss, c, n, b in bad_sc],
     "level_shifts": [{"範圍": c, "切點季": ss, "前段中位": round(b, 1),
@@ -2071,10 +2228,17 @@ coverage = {
     # Layer 2a‴
     "group_level_shifts": grp_steps,
     "group_thin": grp_thin,
+    "group_unchecked": grp_unchecked,
     "group_shift_extremes": grp_extremes,
+    "group_step_down": GROUP_STEP_DOWN,
+    "group_step_up": GROUP_STEP_UP,
+    "dead_prefixes_in_groups": dead_prefixes_in_groups,
+    "steps_unchecked": steps_unchecked,
     # Layer 4：外部絕對錨。status 有 passed / failed / unavailable / insufficient / disabled
     # 五種——**只有 passed 代表這一層真的跑過**，其餘都是「沒有人擋」。
     "external_anchor": {**anchor,
+                        "required": ANCHOR_REQUIRED,
+                        "enabled": ANCHOR_ENABLE,
                         "bad_level": anchor_bad_level,
                         "flagged": anchor_flagged,
                         "level_shifts": anchor_steps,
@@ -2093,9 +2257,16 @@ coverage = {
                                 "min_cover": SNAPSHOT_MIN_COVER}},
     "passed": bool(not LAYER1["missing_seasons"] and not LAYER1["partial_seasons"]
                    and not load_failed and len(bad_ret) == 0 and not dead_groups
-                   and not prefix_runs and not grp_steps and not dead_city
-                   and not bad_sc and not steps and flagged.empty
-                   and anchor["status"] != "failed" and snap["status"] != "failed"),
+                   and not prefix_runs and not grp_steps and not grp_unchecked
+                   and not dead_city
+                   and not bad_sc and not steps and not steps_unchecked
+                   and flagged.empty
+                   and anchor["status"] != "failed" and snap["status"] != "failed"
+                   # ANCHOR_REQUIRED=True 的時候，unavailable / insufficient 也算不過。
+                   # 少了這一條，「ANCHOR_REQUIRED=True + COVERAGE_STRICT=False」會印出
+                   # 「❌ Layer 4：外部錨不可用」緊接著「passed = True」。
+                   and not (ANCHOR_REQUIRED and ANCHOR_ENABLE
+                            and anchor["status"] != "passed")),
     # passed=True 的意思是「這九層都沒中標」，不是「資料一定完整」。
     # 把限制一起寫進 JSON，免得下游只看到 passed=True 就以為萬無一失。
     "limitations": [
@@ -2104,6 +2275,17 @@ coverage = {
         "Layer 4 的絕對下限已用真實資料校準（0.61 ≈ 實測最小 0.876 × 0.7），"
         "但實測解析度只有「等比例少算 30%」——少算 25% 仍會通過全部各層。"
         "「每年重複出現的長缺口」同理：滾動四季比值會一起沉，只有絕對水準接得到",
+        "2a′ 的相對基準有兩支：局部（窗口 7）對**連續 ≥4 季**的缺口恆等於 1.000"
+        "（純算術：median 是第 4 小，窗口內有 ≥4 個缺口值時 median 就是缺口值）。"
+        "挖空基準（挖掉自己 ±7 季、只用距離 8–16 季的鄰居）補掉那條盲帶——"
+        "實測注入「臺中住宅大樓 -50%」時，連續 4／6／10 季的偵測值都是 0.499"
+        "（**與缺口長度無關**），對門檻 0.55 都接得到。"
+        "偵測深度的下限是「掉 ≥ 45%」；掉 30% 時挖空比值約 0.70，接不到。"
+        "缺口連續超過 15 季（2×PUNCH_INNER+1）時挖空基準也會開始失效。"
+        "**另一端也有殘留**：只有 1–3 季的缺口，挖空基準的分母裡缺口佔比太低、"
+        "局部基準又被真實單季變異（主型態佔比局部最小 0.659）蓋住——"
+        "實測「臺中住宅大樓連續 2 季 -50%」十層全綠。那個量約佔全國主型態 0.6%，"
+        "刻意接受",
         "型態用語**部分**改版：2a″ 只認恰好 0，2a‴ 接得到 f ≥ 0.45（18/36 季的形狀）。"
         "但**全 36 季一起**部分改版三層都接不到（2a′ 的局部基準會一起沉、"
         "2a‴ 沒有階梯、Layer 4/5 的分子在型態篩選之前所以結構上失明）。"
@@ -2117,8 +2299,14 @@ coverage = {
         "序列後段掉到 55–70% 實測靜默損失達 23%；序列前段掉到 45–55%（2b′ 上升門檻 2.5 之下）"
         "實測靜默損失達 31–38%。用語改版路徑有 2a′ 與 2a″ 兜著，"
         "純檔案截斷路徑靠 Layer 4 的滾動比值階梯（0.80）接手，Layer 4 缺席就沒人接",
-        "已用真實資料校準：2a′ 的 0.60/0.45、ANCHOR_RATIO_MIN/MAX 的 0.61/2.50。"
-        "仍未校準：2b 的 0.35、2b′ 與 2a‴ 的 0.55/2.5、Layer 3 的 0.40",
+        "已用真實資料校準：2a′ 的 0.60/0.45（實測局部最小 0.840/0.659）、"
+        "ANCHOR_RATIO_MIN/MAX 的 0.61/2.50（實測 0.876~1.404）、"
+        "2a‴ 的 0.45（實測下降最小 0.681，臺中公寓）、"
+        "Layer 4 階梯 0.75/1.50（實測下降最小 0.882，餘裕 17.6%——最緊的是下降側，"
+        "不是註解一度寫的上升側 23%）。仍未校準：2b 的 0.35、2b′ 的 0.55/2.5、Layer 3 的 0.40",
+        "**2a‴ 的下降門檻會隨 SEASONS 延長而變緊**：公寓的全國逐季命中數已從峰值 8,642"
+        "掉到 3,972，而 level_shift 的最後一個切點只用最後 4 季當後段中位。"
+        "每次把窗口往後延，都要回頭看 2a‴ 印的極值表",
         "門檻餘裕隨資料量反向變化且偏差有方向：合成資料會低估誤報餘裕（保守）、"
         "**高估偵測邊界（危險）**。實測同一缺陷在 2% 量體下 2a′ f=0.65 中標、"
         "20% 量體下要 f≈0.99。合成資料量到的偵測邊界一律當樂觀值看",
@@ -2172,8 +2360,11 @@ if _lost:
     raise RuntimeError(
         f"KEEP 有 {len(_lost)} 個欄位不在清整結果中：{_lost}\n"
         "USE_COLS 是由 KEEP 推導的（見 §0 的 DERIVED_COLS），所以這不該發生。\n"
-        "若那幾欄是清整過程產生的衍生欄，把它們加進 DERIVED_COLS；"
-        "若是來源欄位，檢查 load_one 有沒有把它丟掉。")
+        "依可能性排序：\n"
+        f"  1. 那幾欄被**誤放進 DERIVED_COLS** → 就不會進 USE_COLS、也就沒被讀。"
+        f"（目前 DERIVED_COLS 含 {sorted(DERIVED_COLS & set(_lost)) or '無交集'}）\n"
+        "  2. 來源改了欄名 → 加進 COL_ALIASES（load_one 會印出「期待卻不存在的欄名」）\n"
+        "  3. 真的是清整過程產生的衍生欄 → 才是加進 DERIVED_COLS")
 out = lvr[KEEP].copy()
 for c in ("month", "quarter"):
     out[c] = out[c].astype(str)
@@ -2745,12 +2936,21 @@ BUILDING_EXTRA = tuple(t for t in BUILDING_RELAXED if not t.startswith(BUILDING_
 #     代表列被後面的步驟刪掉而整個編號消失，拆解版則另一個子集裡的那列還活著
 #   · concat 把 lvr 放前面 + keep="first" → 拆解版永遠偏好主型態，單次版偏好 raw 順序
 # 所以先問這個交集在不在，有就老實跑單次（慢，但正確）。
-_bt_raw = raw["建物型態"].fillna("")
-_ids_main = set(map(tuple, raw.loc[_bt_raw.str.startswith(BUILDING_MAIN),
-                                   ["縣市", "編號"]].to_numpy()))
-_ids_extra = set(map(tuple, raw.loc[_bt_raw.str.startswith(BUILDING_EXTRA),
-                                    ["縣市", "編號"]].to_numpy())) if BUILDING_EXTRA else set()
+# 一個 (縣市, 編號) 只可能同時落在兩個型態子集 ⟺ 它有 ≥2 列且型態不同
+# （前綴互斥、一列只有一個型態）。所以交集必為「重複的 (縣市, 編號)」的子集——
+# 先用 duplicated 把候選縮到那幾列，不要對全部 143 萬列建兩個 set
+# （那要約 150 MB 與數秒；真實資料上重複率是 0.00%，等於白花）。
+_dupmask = raw.duplicated(subset=["縣市", "編號"], keep=False)
+_cand = raw.loc[_dupmask, ["縣市", "編號", "建物型態"]]
+_bt_raw = _cand["建物型態"].fillna("")
+_ids_main = set(map(tuple, _cand.loc[_bt_raw.str.startswith(BUILDING_MAIN),
+                                     ["縣市", "編號"]].to_numpy()))
+_ids_extra = (set(map(tuple, _cand.loc[_bt_raw.str.startswith(BUILDING_EXTRA),
+                                       ["縣市", "編號"]].to_numpy()))
+              if BUILDING_EXTRA else set())
 _overlap = _ids_main & _ids_extra
+print(f"（重複的 (縣市, 編號) 候選 {int(_dupmask.sum()):,} 列 → "
+      f"跨型態交集 {len(_overlap):,} 個）")
 if not BUILDING_EXTRA:
     lvr_relaxed = lvr.copy()          # BUILDING_RELAXED 等於 BUILDING_MAIN
 elif _overlap:
@@ -2762,7 +2962,7 @@ else:
     # 而且省掉對主型態那批列重跑一次 street_key 的逐列迴圈（本 notebook 最慢的一段）
     lvr_extra, _ = clean_lvr(raw, BUILDING_EXTRA, verbose=False)
     lvr_relaxed = pd.concat([lvr, lvr_extra], ignore_index=True)
-del _ids_main, _ids_extra, _overlap, _bt_raw
+del _ids_main, _ids_extra, _overlap, _bt_raw, _dupmask, _cand
 lvr_relaxed = lvr_relaxed[lvr_relaxed["district"].isin(set(districts["district"]))]
 print(f"放寬後：{len(lvr_relaxed):,} 筆（嚴格 {len(lvr_m):,} 筆，"
       f"倍數 {len(lvr_relaxed) / max(len(lvr_m), 1):.2f}×）\n")
@@ -3129,6 +3329,36 @@ else:
         [f"> - **{r['縣市']} {r['組']} 的季命中數在 {r['切點季']} 出現階梯"
          f"（{r['前段中位']:,.0f} → {r['後段中位']:,.0f}，{r['方向']}）**"
          for r in coverage["group_level_shifts"][:5]] +
+        # 以下這幾條原本漏了。若唯一的失敗來自它們，說明區塊會一個原因都沒列。
+        ([f"> - **{len(coverage['bad_retention'])} 個檔案的日期率或型態佔比異常（2a′）**"
+          f"：{'、'.join(r['檔名'] for r in coverage['bad_retention'][:6])}"
+          + ("…" if len(coverage["bad_retention"]) > 6 else "")]
+         if coverage["bad_retention"] else []) +
+        ([f"> - **{len(coverage['bad_season_city'])} 個（發布季 × 縣市）筆數異常偏低（2b）**"
+          f"：{'、'.join(f"{r['發布季']}{r['縣市']}" for r in coverage['bad_season_city'][:6])}"]
+         if coverage["bad_season_city"] else []) +
+        ([f"> - **{len(coverage['group_unchecked'])} 個（縣市 × 組）季數不足、"
+          f"2a‴ 的階梯檢查沒跑**"] if coverage["group_unchecked"] else []) +
+        ([f"> - **2b′ 有 {len(coverage['steps_unchecked'])} 個序列季數不足、階梯檢查沒跑**"]
+         if coverage["steps_unchecked"] else []) +
+        ([f"> - **外部錨的階梯 {len(coverage['external_anchor']['level_shifts'])} 個**："
+          + "、".join(f"{r['縣市']} {r['切點季']} {r['比值']:.0%}"
+                      for r in coverage["external_anchor"]["level_shifts"][:5])]
+         if coverage["external_anchor"]["level_shifts"] else []) +
+        ([f"> - **{len(coverage['external_anchor']['unchecked_cities'])} 個縣市"
+          f"沒有被外部錨檢查到**："
+          + "、".join(r["縣市"] for r in coverage["external_anchor"]["unchecked_cities"])]
+         if coverage["external_anchor"]["unchecked_cities"] else []) +
+        ([f"> - **{len(coverage['external_anchor'].get('cities_no_official') or [])} 個縣市"
+          f"在官方資料裡一格都對不到**（縣市名對不上或版面改了）"]
+         if coverage["external_anchor"].get("cities_no_official") else []) +
+        ([f"> - **型態組比上次執行少了 {len(coverage['snapshot']['group_dropped'])} 格**"
+          f"（counts 看不到型態路徑，group_counts 才看得到）"]
+         if coverage["snapshot"]["group_dropped"] else []) +
+        ([f"> - **Layer 4 的狀態是 `{coverage['external_anchor']['status']}` 而"
+          f"ANCHOR_REQUIRED = True**"]
+         if (coverage["external_anchor"]["status"] != "passed"
+             and coverage["external_anchor"].get("required")) else []) +
         ([f"> - **外部錨比值越界或算不出來**："
           + "、".join(f"{r['縣市']} {r['比值'] if r['比值'] is not None else '無法比對'}"
                       for r in coverage["external_anchor"]["bad_level"])

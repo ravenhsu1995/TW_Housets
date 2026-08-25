@@ -8,12 +8,26 @@
 
 | Notebook | 內容 | 狀態 |
 |---|---|---|
-| [`00_density_check`](notebooks/00_density_check.ipynb) | Y 變數密度分析 → **決定粒度** | ✅ 可執行 |
-| [`01_gee_imagery`](notebooks/01_gee_imagery.ipynb) | Sentinel-2 → 遙測指數 CSV | ⬜ 骨架 |
+| [`00_density_check`](notebooks/00_density_check.ipynb) | Y 變數密度分析 → **決定粒度** | ✅ 已跑完真實資料 |
+| [`01_imagery`](notebooks/01_imagery.ipynb) | Sentinel-2 → 遙測指數 CSV | ✅ 可執行 |
 | [`02_data_merge`](notebooks/02_data_merge.ipynb) | 實價登錄 + 遙測 + POI + 社經 → 大表 | ⬜ 骨架 |
 | [`03_modeling`](notebooks/03_modeling.ipynb) | XGBoost A vs B → MAPE 比較 | ⬜ 骨架 |
 | [`04_vlm_narratives`](notebooks/04_vlm_narratives.ipynb) | Claude 解讀影像對 → 變遷故事 | ⬜ 骨架 |
 | [`app/streamlit_app.py`](app/streamlit_app.py) | Demo dashboard | ⬜ 骨架 |
+
+## 粒度已定案
+
+NB0 在完整真實資料上跑完（36 個發布季、1,439,345 筆），結果在
+[`data/processed/density_report.md`](data/processed/density_report.md)：
+
+| 方案 | 全母體 n≥5 | 子母體 n≥5 | 判定 |
+|---|---|---|---|
+| 村里 × 月 | 35.4% | 40.0% | ❌ 理論上限就 ≤ 50%，確定出局 |
+| 村里 × 季 | 65.4% | 73.8% | 🟡 未定（上限過關，但街道情境只 29.3%、戶數 42.0%） |
+| **鄉鎮市區 × 月** | **55.3%** | **75.3%** | ✅ **採用**（精確值） |
+| 鄉鎮市區 × 季 | 60.8% | 82.8% | ✅ 精確值 |
+
+分母雙口徑 **0/8 衝突**。村里粒度沒有被否證，只是未定——要定案得做地址 geocoding。
 
 ## 先跑 NB0
 
