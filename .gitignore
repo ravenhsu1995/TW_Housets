@@ -1,0 +1,25 @@
+# --- 資料檔：體積大、可重新產生，不進版控 ---
+data/raw/*
+data/processed/*
+data/vlm_outputs/*
+!data/**/.gitkeep
+
+# 但密度報告是 NB0 的決策依據，要留下來
+!data/processed/density_report.md
+!data/processed/density_decision.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- 憑證 ---
+.env
+*.key
+service_account*.json
+.streamlit/secrets.toml
+
+# --- OS ---
+.DS_Store
