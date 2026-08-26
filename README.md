@@ -4,16 +4,66 @@
 
 完整規格見 [`taiwan-housets-mvp-plan_3.md`](taiwan-housets-mvp-plan_3.md)。基礎設施成本 $0，唯一現金支出是 NB4 的 VLM token（US$0.3 – 16）。
 
+## 結論：假設**不成立**
+
+> Sentinel-2 遙測指數（NDVI、NDBI）加入 XGBoost 後，房價預測 MAPE 可降低。
+
+**沒有降低，而且顯著變差。** 完整結果在
+[`data/processed/modeling_result.json`](data/processed/modeling_result.json)。
+
+```
+MAPE_A（無影像）  13.15 ± 0.32          粒度：鄉鎮市區 × 月
+MAPE_B（加影像）  13.73 ± 0.40          test 1,621 列（107 區 × 6 季）
+ΔMAPE            −0.576 ± 0.479 pp     ← 負值 = 影像讓模型變差
+單元 cluster      p = 0.0016、bootstrap p = 0.0005
+                  95% CI [−0.749, −0.186]   ← 完全落在 0 以下
+```
+
+三條成功標準 **1/3**（只有「SHAP 前 10」達成）。六都**沒有任何一個**顯著改善，
+桃園（p=0.009）與高雄（p=0.020）顯著**變差**。
+
+### 為什麼這不是「訊號太弱」而是「沒有區域專屬訊號」
+
+三個負對照各自獨立地指向同一結論：
+
+| 對照 | 結果 | 意義 |
+|---|---|---|
+| **真實影像 vs 輪換影像**（把每區的影像換成別區的，同 seed） | **−0.133 pp** | 影像**認不出自己的單元** |
+| **時間打散**（單元內打散影像的時間對應） | 時間訊號 −0.246 pp | 也沒有時間訊號 |
+| **三層特徵集**（A0 純外生／A1 計畫定義／A2 +分區） | −1.02 / −0.22 / −1.15 | 符號全部一致 |
+
+第三項很關鍵：驗證實測過「特徵集 A 怎麼定義」能讓 ΔMAPE 橫跨 **3.4 pp**（比 2 pp 的
+成功門檻還大），所以**只有符號一致才下得了結論**。
+
+而且**所有已知偏誤都偏袒影像**（缺捷運通車特徵、土地分區用交易組成代理、評估集被
+影像品質挑過）——真實增量只會更負。
+
+**SHAP 最說明問題**：NDVI 排第 10、與戶數密度 Spearman −0.68，它**確實帶資訊**；
+但 out-of-sample 是負的 → 那個資訊**與既有特徵冗餘**，淨效果是增加變異。
+前 9 名全是 POI 與時間特徵。**「進 SHAP 前 10」不是增量的證據，只代表樹用了它。**
+
+### 依計畫 §11 的決策樹
+
+「MAPE 改善 ≥ 2pp？否 → 改善 0–2pp？否 → **停止**，轉向用 VLM 做都市變遷監測報告。」
+
+唯一可能翻案的技術方向是**村里粒度**——10m 影像對平均 30 km² 的行政區太粗，
+村里（均 0.3 km²）才有機會抓到建物級變化。但要先做地址 geocoding 才能定案密度
+（NB0 判定村里×季為 UNDETERMINED），且影像解析度要降到 20–30m，成本漲一個量級。
+
 ## 目前進度
 
 | Notebook | 內容 | 狀態 |
 |---|---|---|
 | [`00_density_check`](notebooks/00_density_check.ipynb) | Y 變數密度分析 → **決定粒度** | ✅ 已跑完真實資料 |
-| [`01_imagery`](notebooks/01_imagery.ipynb) | Sentinel-2 → 遙測指數 CSV | ✅ 可執行 |
-| [`02_data_merge`](notebooks/02_data_merge.ipynb) | 實價登錄 + 遙測 + POI + 社經 → 大表 | ✅ 可執行 |
-| [`03_modeling`](notebooks/03_modeling.ipynb) | XGBoost A vs B → **假設的答案** | ✅ 可執行 |
-| [`04_vlm_narratives`](notebooks/04_vlm_narratives.ipynb) | Claude 解讀影像對 → 變遷故事 | ⬜ 骨架 |
+| [`01_imagery`](notebooks/01_imagery.ipynb) | Sentinel-2 → 遙測指數 CSV | ✅ 已跑完真實資料 |
+| [`02_data_merge`](notebooks/02_data_merge.ipynb) | 實價登錄 + 遙測 + POI + 社經 → 大表 | ✅ 已跑完真實資料 |
+| [`03_modeling`](notebooks/03_modeling.ipynb) | XGBoost A vs B → **假設的答案** | ✅ 已跑完真實資料 |
+| [`04_vlm_narratives`](notebooks/04_vlm_narratives.ipynb) | Claude 解讀影像對 → 變遷故事 | ⬜ 骨架（計畫 §11 指定的轉向） |
 | [`app/streamlit_app.py`](app/streamlit_app.py) | Demo dashboard | ⬜ 骨架 |
+
+四層檢查（NB0 十層涵蓋率、NB1 七層合理性、NB2 五層整合、NB3 五個負對照）全部通過，
+過程中經歷四輪對抗式驗證，**每一輪都找到真缺陷**，其中兩輪找到的缺陷會直接讓最終
+答案失效。細節見各 notebook 的 §3.2 / §3 / §6 與 commit log。
 
 ## 粒度已定案
 

@@ -4,9 +4,15 @@ data/processed/*
 data/vlm_outputs/*
 !data/**/.gitkeep
 
-# 但密度報告是 NB0 的決策依據，要留下來
+# 但「決策依據」與「答案」要留在版控裡，不然重跑一次要好幾小時
 !data/processed/density_report.md
 !data/processed/density_decision.json
+!data/processed/rs_report.md
+!data/processed/rs_meta.json
+!data/processed/merge_meta.json
+!data/processed/modeling_result.json
+# NB1 的遙測輸出（828 KB）：抽一次要兩小時，留著讓 NB2/NB3 可以直接重跑
+!data/processed/unit_remote_sensing.csv
 
 # --- Python ---
 __pycache__/

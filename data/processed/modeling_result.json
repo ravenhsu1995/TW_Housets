@@ -1,0 +1,327 @@
+{
+ "generated_at": "2026-08-26 04:04:55",
+ "scheme": "鄉鎮市區 × 月",
+ "n_seeds": 20,
+ "split": {
+  "train_start": "2018Q3",
+  "train_end": "2022Q4",
+  "val_end": "2023Q2",
+  "test_end": "2024Q4"
+ },
+ "n_test_rows": 1621,
+ "features_A": [
+  "n_convenience",
+  "n_hospital",
+  "n_park",
+  "n_retail",
+  "n_school",
+  "n_station",
+  "dens_convenience",
+  "dens_hospital",
+  "dens_park",
+  "dens_retail",
+  "dens_school",
+  "dens_station",
+  "dist_station",
+  "dist_school",
+  "dist_park",
+  "area_km2",
+  "hh_density",
+  "income_mean",
+  "income_median_w",
+  "income_rel",
+  "t_index",
+  "q_sin",
+  "q_cos",
+  "m_sin",
+  "m_cos",
+  "area_median",
+  "age_median",
+  "floor_ratio_median",
+  "total_floor_median"
+ ],
+ "features_img": [
+  "NDVI",
+  "NDBI",
+  "MNDWI",
+  "dNDVI",
+  "dNDBI"
+ ],
+ "mape": {
+  "A_mean": 13.155,
+  "A_sd": 0.316,
+  "B_mean": 13.731,
+  "B_sd": 0.397
+ },
+ "by_city": {
+  "新北市": {
+   "ape_A": 13.554,
+   "ape_B": 13.248,
+   "ΔMAPE": 0.306
+  },
+  "桃園市": {
+   "ape_A": 11.44,
+   "ape_B": 12.472,
+   "ΔMAPE": -1.032
+  },
+  "臺中市": {
+   "ape_A": 14.5,
+   "ape_B": 15.082,
+   "ΔMAPE": -0.581
+  },
+  "臺北市": {
+   "ape_A": 8.458,
+   "ape_B": 8.628,
+   "ΔMAPE": -0.17
+  },
+  "臺南市": {
+   "ape_A": 13.433,
+   "ape_B": 14.549,
+   "ΔMAPE": -1.116
+  },
+  "高雄市": {
+   "ape_A": 15.244,
+   "ape_B": 16.248,
+   "ΔMAPE": -1.004
+  }
+ },
+ "city_test": {
+  "臺北市": {
+   "n_cluster": 12,
+   "n_cell": 72,
+   "mean_diff": -0.1704,
+   "t": -1.14439,
+   "p": 0.27675,
+   "boot_p": 0.235,
+   "ci_lo": -0.46527,
+   "ci_hi": 0.09135,
+   "icc": 0.44968,
+   "p_naive_cell": 0.05517,
+   "顯著改善": false
+  },
+  "新北市": {
+   "n_cluster": 21,
+   "n_cell": 103,
+   "mean_diff": 0.11256,
+   "t": 0.27343,
+   "p": 0.78732,
+   "boot_p": 0.755,
+   "ci_lo": -0.69416,
+   "ci_hi": 0.87816,
+   "icc": 0.48534,
+   "p_naive_cell": 0.23053,
+   "顯著改善": false
+  },
+  "桃園市": {
+   "n_cluster": 12,
+   "n_cell": 62,
+   "mean_diff": -1.03675,
+   "t": -3.16224,
+   "p": 0.00904,
+   "boot_p": 0.001,
+   "ci_lo": -1.67037,
+   "ci_hi": -0.46563,
+   "icc": 0.48876,
+   "p_naive_cell": 0.0,
+   "顯著改善": false
+  },
+  "臺中市": {
+   "n_cluster": 22,
+   "n_cell": 126,
+   "mean_diff": -0.44761,
+   "t": -1.72003,
+   "p": 0.10013,
+   "boot_p": 0.063,
+   "ci_lo": -0.95756,
+   "ci_hi": 0.02533,
+   "icc": 0.24557,
+   "p_naive_cell": 0.01537,
+   "顯著改善": false
+  },
+  "臺南市": {
+   "n_cluster": 19,
+   "n_cell": 92,
+   "mean_diff": -0.6396,
+   "t": -1.50049,
+   "p": 0.15083,
+   "boot_p": 0.142,
+   "ci_lo": -1.44226,
+   "ci_hi": 0.20208,
+   "icc": 0.53719,
+   "p_naive_cell": 5e-05,
+   "顯著改善": false
+  },
+  "高雄市": {
+   "n_cluster": 21,
+   "n_cell": 114,
+   "mean_diff": -0.74005,
+   "t": -2.52988,
+   "p": 0.01992,
+   "boot_p": 0.004,
+   "ci_lo": -1.31016,
+   "ci_hi": -0.17682,
+   "icc": 0.50119,
+   "p_naive_cell": 0.0,
+   "顯著改善": false
+  }
+ },
+ "overall_paired_test_quarter": {
+  "n_pair": 569,
+  "mean_diff": -0.5368501980281767,
+  "t": -6.294530951154055,
+  "p": 6.170380150475968e-10,
+  "wilcoxon_p": 5.911023967278428e-15
+ },
+ "verdict": {
+  "criteria": {
+   "1_mape_ge_2pp": {
+    "target": 2.0,
+    "actual": -0.576,
+    "sd_across_seeds": 0.479,
+    "se": 0.107,
+    "cluster_ci": [
+     -0.749,
+     -0.186
+    ],
+    "met": false
+   },
+   "2_cities_significant": {
+    "target": 3,
+    "actual": 0,
+    "cities_in_test": [
+     "臺北市",
+     "新北市",
+     "桃園市",
+     "臺中市",
+     "臺南市",
+     "高雄市"
+    ],
+    "cities_missing": [],
+    "met": false
+   },
+   "3_shap_top10": {
+    "met": true,
+    "img_ranks": {
+     "NDVI": 10,
+     "NDBI": 14,
+     "MNDWI": 16,
+     "dNDBI": 29,
+     "dNDVI": 30
+    }
+   }
+  },
+  "n_criteria_met": 1,
+  "controls": {
+   "null_imagery_small": true,
+   "time_signal_positive": false,
+   "net_vs_null_positive": false,
+   "quarterly_same_sign": true,
+   "tier_sign_consistent": true
+  },
+  "controls_status": "na_null_result",
+  "negative_controls": {
+   "N1_unit_rotated": {
+    "dMAPE_mean": -0.442,
+    "dMAPE_sd": 0.669
+   },
+   "N1b_gaussian": {
+    "dMAPE_mean": 0.071,
+    "dMAPE_sd": 0.55
+   },
+   "net_vs_null_direct": {
+    "mean": -0.133,
+    "sd": 0.432
+   },
+   "N2_shuffled": {
+    "dMAPE_mean": -0.33,
+    "dMAPE_sd": 0.458,
+    "within": "unit×split（不跨邊界）"
+   },
+   "N3_quarterly": {
+    "dMAPE_mean": -0.916,
+    "dMAPE_sd": 0.531,
+    "p": 0.0
+   },
+   "N4_no_new_station": {
+    "n_units_excluded": 9,
+    "dMAPE_mean": -1.091,
+    "dMAPE_sd": 0.045,
+    "coverage_warning": "OSM start_date 覆蓋率僅約 15%，此 robustness 只碰到少數單元，「缺少通車前後特徵而偏袒影像」這個偏誤實質上未被排除"
+   },
+   "feature_tiers": {
+    "A0": {
+     "n_feats": 25,
+     "dMAPE_mean": -1.018,
+     "dMAPE_sd": 0.432
+    },
+    "A1": {
+     "n_feats": 29,
+     "dMAPE_mean": -0.223,
+     "dMAPE_sd": 0.35
+    },
+    "A2": {
+     "n_feats": 34,
+     "dMAPE_mean": -1.147,
+     "dMAPE_sd": 0.816
+    }
+   },
+   "tier_sign_consistent": true,
+   "N5_income_actual": {
+    "skipped": "沒有遞延"
+   }
+  },
+  "derived": {
+   "net_vs_null_pp": -0.133,
+   "time_signal_pp": -0.246,
+   "delta_mdape_pp": -0.38,
+   "is_null": true,
+   "exceeds_seed_noise": true,
+   "mean_exceeds_2se": true,
+   "significantly_negative": true
+  },
+  "overall": "NOT_SUPPORTED_NEGATIVE"
+ },
+ "delta_mape_by_seed": [
+  -0.2238,
+  -0.3069,
+  -0.5925,
+  0.3523,
+  -0.3417,
+  -0.9601,
+  -0.7289,
+  -1.1578,
+  -0.7701,
+  -0.8439,
+  -0.8129,
+  -1.6602,
+  -0.4954,
+  0.1538,
+  -1.0051,
+  -0.7734,
+  -0.2754,
+  -0.8321,
+  -0.2853,
+  0.0441
+ ],
+ "cluster_test": {
+  "n_cluster": 107,
+  "n_cell": 569,
+  "mean_diff": -0.46414071299719667,
+  "t": -3.246702077212155,
+  "p": 0.00156337948811493,
+  "boot_p": 0.0005,
+  "ci_lo": -0.74859902081508,
+  "ci_hi": -0.18626346222914822,
+  "icc": 0.45394357672449975
+ },
+ "inherited_biases": [
+  "捷運通車前後特徵缺失（OSM start_date 覆蓋率 11%）→ **偏袒影像**：新站周邊的新建案正好是 ΔNDBI 會抓到的。NB3 必須做「只留窗口內沒有新站的單元」的 robustness check",
+  "土地使用分區用交易組成當代理、不是面積佔比 → **偏袒影像**：建成區面積佔比與 NDBI 量的是同一件事",
+  "戶數是靜態快照（無時間變異），是慢變控制變數",
+  "特徵集 A 的定義本身會讓 ΔMAPE 大幅移動（實測跨合理定義的分散比 2 pp 的成功門檻還大）→ 分成 A0（純外生）／A1（+同期建物屬性，計畫字面定義）／A2（+分區組成）三層，NB3 要三層都報，結論只在符號一致時才成立",
+  "A1／A2 含「當期那批交易」算出來的組成（坪數、屋齡、樓層中位數）——那與 Y 出自同一個 groupby，對「預測」的主張而言是同期前視。主結果用 A1（計畫字面要求）但必須同時報 A0",
+  "n_solar_day / valid_pixel_ratio 是 Sentinel-2 的產物，已從特徵集移除（只當品質篩選）——放進 A 的話「無影像基準」就用到了衛星資料",
+  "2024 年的所得用 2022 年遞延（財政部尚未發布）→ NB3 要對 income_year_used 做敏感度測試",
+  "NB1 提醒：2017 各季影像不可用、帶差分特徵的窗口從 2019Q1 起——NB3 的時間切分要照這個調整，不要照計畫的 2017Q1"
+ ]
+}

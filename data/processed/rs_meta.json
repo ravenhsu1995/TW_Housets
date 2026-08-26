@@ -1,0 +1,103 @@
+{
+ "generated_at": "2026-08-26 03:59:28",
+ "spatial_unit": "鄉鎮市區",
+ "n_units": 158,
+ "imagery_freq": "季",
+ "structural_repeat_with_price": true,
+ "window": [
+  "2017Q1",
+  "2024Q4"
+ ],
+ "n_quarters": 32,
+ "resolution_m": 200,
+ "crs": "EPSG:32651",
+ "collection": "sentinel-2-l2a",
+ "stac": "https://earth-search.aws.element84.com/v1",
+ "scl_keep": [
+  4,
+  5,
+  6
+ ],
+ "cloud_steps": [
+  35,
+  60,
+  101
+ ],
+ "usable_window_note": "2017 各季的 solar day 數過少（ESA 當年對東亞取像計畫疏），帶差分特徵的建模窗口建議從 2019Q1 起",
+ "checks": {
+  "I1": {
+   "n_expected": 5056,
+   "n_have": 5056,
+   "n_missing": 0,
+   "n_extra": 0
+  },
+  "I2": {
+   "floor": 0.3,
+   "quarter_min": 0.5,
+   "n_low_cells": 198,
+   "low_cell_share": 0.0392,
+   "bad_quarters": [],
+   "low_but_thin_quarters": [
+    "2017Q2"
+   ]
+  },
+  "small_units": {
+   "threshold": 50,
+   "units": {}
+  },
+  "I3": {
+   "min_days": 3,
+   "thin_quarters": [
+    "2017Q1",
+    "2017Q2",
+    "2019Q2",
+    "2022Q1",
+    "2022Q2"
+   ]
+  },
+  "I4": {
+   "out_of_range": {
+    "NDVI": 0,
+    "NDBI": 0,
+    "MNDWI": 0
+   },
+   "nan_share": {
+    "NDVI": 0.0121,
+    "NDBI": 0.0121,
+    "MNDWI": 0.0121
+   }
+  },
+  "I5": {
+   "split": "2022Q1",
+   "tol": 0.1,
+   "n_stable_units": 31,
+   "worst_rel_diff": 0.0761
+  },
+  "I6": {
+   "by_season": {
+    "1": 0.3853,
+    "2": 0.4037,
+    "3": 0.4509,
+    "4": 0.4374
+   },
+   "summer_minus_winter": 0.0159
+  },
+  "I7": {
+   "n_units": 158,
+   "spearman_vs_hh_density": {
+    "NDVI": -0.678,
+    "NDBI": 0.689,
+    "MNDWI": 0.649
+   }
+  },
+  "passed": true,
+  "limitations": [
+   "I5 與 I7 之外的每一層都是拿資料跟自己比，對「基準被污染」無免疫力",
+   "I5 只看得到 baseline 轉換那一個日期的階梯；別的日期發生的口徑變更看不到",
+   "I7 是全期平均的空間相關，對「某幾季對位錯」失明（那需要逐季做）",
+   "雲遮罩的偏差不是隨機的：雲多的季節被刮掉的像素比例更高，而那些季節正好是植被最盛的時候 → 指數的時間序列有系統性偏差，I2 只擋得住嚴重的情況",
+   "solar day < 3 的季只標記不中止（2017 全年都是）——NB3 要自己避開",
+   "NDBI/MNDWI 用 B11（原生 20m），有效空間解析度是 20m 不是 10m"
+  ]
+ }
+}
