@@ -1,5 +1,25 @@
 # TaiwanTS MVP
 
+## In English
+
+**Question:** Does adding Sentinel-2 satellite indices (NDVI, NDBI) to an XGBoost model lower its error on Taiwan house prices?
+
+**Answer: No. Imagery made the error worse.**
+
+| Model | MAPE |
+|---|---|
+| Without imagery | 13.15% ± 0.32 |
+| With imagery | 13.73% ± 0.40 |
+
+- Test set: 1,621 district-month rows.
+- Unit-cluster p = 0.0016, bootstrap p = 0.0005; 95% CI for the change in MAPE: [−0.749, −0.186] percentage points.
+- I wrote down three success criteria before running anything. It met 1 of 3: at least one satellite feature in the SHAP top 10 (NDVI ranked 10th). That shows the model used it, not that it helped.
+- Built Aug 25–26, 2026 in five Colab notebooks; infrastructure cost $0.
+
+Full results: [`data/processed/modeling_result.json`](data/processed/modeling_result.json). The write-up below is in Chinese.
+
+---
+
 用五本 Colab notebook 驗證一個假設：**Sentinel-2 遙測指數（NDVI、NDBI）加入 XGBoost 後，台灣房價預測 MAPE 能否降低。**
 
 完整規格見 [`taiwan-housets-mvp-plan_3.md`](taiwan-housets-mvp-plan_3.md)。基礎設施成本 $0，唯一現金支出是 NB4 的 VLM token（US$0.3 – 16）。
@@ -13,7 +33,7 @@
 
 ```
 MAPE_A（無影像）  13.15 ± 0.32          粒度：鄉鎮市區 × 月
-MAPE_B（加影像）  13.73 ± 0.40          test 1,621 列（107 區 × 6 季）
+MAPE_B（加影像）  13.73 ± 0.40          test 1,621 列（涵蓋 107 區、6 季）
 ΔMAPE            −0.576 ± 0.479 pp     ← 負值 = 影像讓模型變差
 單元 cluster      p = 0.0016、bootstrap p = 0.0005
                   95% CI [−0.749, −0.186]   ← 完全落在 0 以下
